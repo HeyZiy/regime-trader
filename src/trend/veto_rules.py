@@ -2,38 +2,37 @@
 """
 趋势波段策略 — 负面清单（硬否决层）
 
-定位：在"剔除规则（removal_rules，趋势破坏）"之后、"信号检测（signal_detector，
+定位：在"跳过规则（skip_rules，趋势破坏）"之后、"信号检测（signal_detector，
 买点 + 质量门）"之前的一道准入闸门。任一规则触发即否决：不进信号池、不看评分。
 
 与相邻层的职责分工：
-- removal_rules：持仓/观察池的"趋势破坏"剔除（跌破10日线、放量长阴等），
-  关注"已经持有的票要不要扔"。
+- skip_rules：持仓/选股名单的"趋势破坏"跳过（跌破10日线、放量长阴等），
+  关注"今天这票还看不看"。
 - veto_rules（本模块）：极端风险/情绪过热标的的"准入否决"，
   关注"再便宜也不能买"。
 - signal_detector：买点形态与信号质量门（is_euphoric / is_overextended）。
 
 规则清单（9 条，任一触发即否决）：
     V1 [外部] 近 20 日发布过股票交易异常波动 / 风险提示公告        → skip
-    V2 [行情] 近 60 日累计涨幅 > 100%                              → remove
+    V2 [行情] 近 60 日累计涨幅 > 100%                              → skip
     V3 [行情] 近 20 日换手率均值 > 12%                             → skip
     V4 [行情] 近 20 日出现 ≥2 次单日跌幅 > 7%                      → skip
     V5 [外部] 近 5 日主力资金净流出 > 流通市值 1%                   → skip
-    V6 [行情] 近 20 日涨停或跌停天数 ≥ 3                           → remove
-    V7 [行情] 距近 60 日最低收盘价的涨幅 > 80%                      → remove
+    V6 [行情] 近 20 日涨停或跌停天数 ≥ 3                           → skip
+    V7 [行情] 距近 60 日最低收盘价的涨幅 > 80%                      → skip
     V8 [行情] 反弹逼近前高（曾深跌≥15% 且当前距 60 日前高 < 10%）   → skip
     V9 [行情] 近 20 日日收益率标准差 > 5%（波动率过大）             → skip
 
 动作语义：
-- remove：极端过热类，从妙想自选池剔除（与 removal_rules 处置一致）。
-- skip  ：暂时性风险类（公告、资金流、换手、大跌、压力位），只跳过当日信号，
-          保留在自选池，后续可能重新合格。
+- 统一为 skip（跳过当日信号）。选股名单每天由妙想选股重新生成，
+  被否决的票当日不出信号，次日名单随新一轮选股重新判定。
 
 设计约定：
-- 行情类规则（V2/V3/V4/V6/V7/V8/V9）纯本地计算，无额外 I/O，可对全池逐股执行。
+- 行情类规则（V2/V3/V4/V6/V7/V8/V9）纯本地计算，无额外 I/O，可对选股名单逐股执行。
 - 外部数据规则（V1/V5）依赖妙想 API 且有日调用限额，只对"已产出信号"的候选
   惰性执行；数据缺失或解析失败一律 fail-open（记 warning 放行），避免外部
   数据源抖动导致整个系统静默黑屏。
-- 换手率列缺失时跳过依赖换手的规则并发 warning（与 removal_rules 同一约定）。
+- 换手率列缺失时跳过依赖换手的规则并发 warning（与 skip_rules 同一约定）。
 """
 
 import logging
@@ -46,12 +45,10 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # === 动作类型 ===
-ACTION_SKIP = "skip"      # 仅跳过当日信号，保留自选池
-ACTION_REMOVE = "remove"  # 从自选池剔除
+ACTION_SKIP = "skip"      # 跳过当日信号
 
 ACTION_LABELS = {
     ACTION_SKIP: "跳过信号",
-    ACTION_REMOVE: "剔除自选池",
 }
 
 # === 规则阈值（集中配置，改这里即改策略）===
@@ -60,6 +57,9 @@ ANNOUNCEMENT_KEYWORDS = ("异常波动", "风险提示", "交易风险", "停牌
 
 GAIN_60D_MAX = 100.0              # V2 近60日累计涨幅上限(%)
 TURNOVER_20D_MAX = 12.0           # V3 近20日换手率均值上限(%)
+# 当日换手率上限(%)：截面状态口径（与 V3 的路径均值口径数值相同，语义不同）。
+# 妙想选股语句（trend_analysis.DEFAULT_SCREEN_KEYWORD）引用本常量，此处为单一阈值来源。
+TURNOVER_DAY_MAX = 12.0
 BIG_DROP_PCT = -7.0               # V4 单日跌幅阈值(%)
 BIG_DROP_MIN_COUNT = 2            # V4 触发所需次数
 FUND_FLOW_DAYS = 5                # V5 主力资金统计天数
@@ -71,7 +71,7 @@ FROM_60D_LOW_MAX = 80.0           # V7 距60日最低收盘涨幅上限(%)
 NEAR_HIGH_PCT = 10.0              # V8 距60日前高的距离阈值(%)
 PULLBACK_DEPTH_RATIO = 0.85       # V8 判定"曾深跌"的回撤比例（最低收盘 ≤ 最高收盘×0.85）
 HIGH_NOT_RECENT_BARS = 3          # V8 前高须形成于≥3个交易日前（排除正在创新高的主升股）
-VOLATILITY_20D_MAX = 5.0           # V9 近20日日收益率标准差上限(%)，博弈激烈、波动过大
+VOLATILITY_20D_MAX = 5.0          # V9 近20日日收益率标准差上限(%)，博弈激烈、波动过大
 
 # 计算 60 日规则所需的最少交易日数（今日 + 60 个交易日前的基准）
 BARS_FOR_60D = 61
@@ -84,20 +84,17 @@ class VetoResult:
     Attributes:
         vetoed: 是否被否决
         reasons: 触发的规则描述列表
-        action: 'skip'（跳过当日信号）或 'remove'（剔除自选池）；
-                多条同时触发时取最重动作（remove > skip）
+        action: 统一为 ACTION_SKIP（跳过当日信号）
     """
 
     vetoed: bool = False
     reasons: List[str] = field(default_factory=list)
     action: str = ACTION_SKIP
 
-    def add(self, reason: str, action: str = ACTION_SKIP) -> None:
-        """记录一条触发的规则（remove 优先级高于 skip）。"""
+    def add(self, reason: str) -> None:
+        """记录一条触发的规则（统一跳过当日信号）。"""
         self.vetoed = True
         self.reasons.append(reason)
-        if action == ACTION_REMOVE:
-            self.action = ACTION_REMOVE
 
 
 # ==================== 行情类规则（V2/V3/V4/V6/V7/V8/V9）====================
@@ -107,7 +104,7 @@ def _limit_move_threshold(code: str) -> float:
 
     创业板/科创板涨跌幅限制 20%，其余 10%；取略低于实际限制的值以覆盖
     9.9%/19.9% 这类四舍五入的封板情况。ST（5%）与北交所（30%）未接入，
-    选股池默认已排除。
+    选股名单默认已排除。
     """
     if code.startswith(("300", "301", "688", "689")):
         return 19.5
@@ -135,14 +132,13 @@ def check_market_veto(code: str, name: str, df: Optional[pd.DataFrame]) -> VetoR
     closes = df['close'].astype(float)
     pct = closes.pct_change() * 100  # 日涨跌幅(%)，首行为 NaN
 
-    # --- V3 近20日换手率均值 > 12%（换手率缺失时跳过，与 removal_rules 同约定）---
+    # --- V3 近20日换手率均值 > 12%（换手率缺失时跳过，与 skip_rules 同约定）---
     if 'turnover_rate' in df.columns and n >= 20:
         tr_20 = pd.to_numeric(df['turnover_rate'].iloc[-20:], errors='coerce')
         tr_mean = tr_20.mean()
         if pd.notna(tr_mean) and tr_mean > TURNOVER_20D_MAX:
             result.add(
                 f"V3 近20日换手均值{tr_mean:.1f}%>{TURNOVER_20D_MAX}%",
-                ACTION_SKIP,
             )
     elif 'turnover_rate' not in df.columns:
         logger.warning(f"  {tag}: 换手率列缺失，负面清单 V3（高换手）跳过")
@@ -153,7 +149,6 @@ def check_market_veto(code: str, name: str, df: Optional[pd.DataFrame]) -> VetoR
         if big_drops >= BIG_DROP_MIN_COUNT:
             result.add(
                 f"V4 近20日{big_drops}次单日跌幅>7%",
-                ACTION_SKIP,
             )
 
     # --- V6 近20日涨停或跌停天数 ≥ 3 ---
@@ -163,7 +158,6 @@ def check_market_veto(code: str, name: str, df: Optional[pd.DataFrame]) -> VetoR
         if limit_days >= LIMIT_MOVE_DAYS:
             result.add(
                 f"V6 近{LIMIT_MOVE_LOOKBACK}日涨跌停{limit_days}天≥{LIMIT_MOVE_DAYS}天",
-                ACTION_REMOVE,
             )
 
     # --- V9 近20日日收益率标准差 > 5%（波动率过大，博弈激烈，不适合低吸）---
@@ -172,7 +166,6 @@ def check_market_veto(code: str, name: str, df: Optional[pd.DataFrame]) -> VetoR
         if pd.notna(vol_std) and vol_std > VOLATILITY_20D_MAX:
             result.add(
                 f"V9 近20日日收益率标准差{vol_std:.1f}%>{VOLATILITY_20D_MAX}%",
-                ACTION_SKIP,
             )
 
     # --- 60 日规则：需要至少 61 个交易日 ---
@@ -194,7 +187,6 @@ def check_market_veto(code: str, name: str, df: Optional[pd.DataFrame]) -> VetoR
         if gain_60d > GAIN_60D_MAX:
             result.add(
                 f"V2 近60日累计涨幅{gain_60d:.1f}%>{GAIN_60D_MAX}%",
-                ACTION_REMOVE,
             )
 
     # --- V7 距近60日最低收盘价的涨幅 > 80% ---
@@ -203,7 +195,6 @@ def check_market_veto(code: str, name: str, df: Optional[pd.DataFrame]) -> VetoR
         if from_low > FROM_60D_LOW_MAX:
             result.add(
                 f"V7 距60日最低收盘涨幅{from_low:.1f}%>{FROM_60D_LOW_MAX}%",
-                ACTION_REMOVE,
             )
 
     # --- V8 反弹逼近前高压力位 ---
@@ -222,7 +213,6 @@ def check_market_veto(code: str, name: str, df: Optional[pd.DataFrame]) -> VetoR
             result.add(
                 f"V8 反弹逼近{bars_from_high}日前高点(距{dist_to_high:.1f}%<{NEAR_HIGH_PCT}%)，"
                 f"期间最大回撤{(1 - low_60 / high_60) * 100:.1f}%",
-                ACTION_SKIP,
             )
 
     if result.vetoed:
@@ -457,17 +447,17 @@ def check_external_veto(
         fetcher: DataFetcherManager 实例，用于取流通市值
 
     Returns:
-        VetoResult；外部规则动作均为 skip（暂时性风险，不剔除自选池）
+        VetoResult；外部规则动作均为 skip（暂时性风险，仅跳过当日信号）
     """
     result = VetoResult()
 
     reason = _check_announcement_veto(code, name, mx_service)
     if reason:
-        result.add(reason, ACTION_SKIP)
+        result.add(reason)
 
     reason = _check_fund_flow_veto(code, name, mx_service, fetcher)
     if reason:
-        result.add(reason, ACTION_SKIP)
+        result.add(reason)
 
     if result.vetoed:
         logger.info(f"🚫 负面清单否决 {name}({code}): {'；'.join(result.reasons)} → {ACTION_LABELS[result.action]}")

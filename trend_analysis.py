@@ -7,22 +7,24 @@
 定位：趋势波段系统。只做主线中的强趋势股，只在缩量回踩时介入。
 
 职责：
-1. 读取妙想自选股或指定股票列表，直接进行技术分析
+1. 每日执行妙想选股得到选股名单（截面状态条件，纯内存，不读不写妙想自选），直接技术分析
 2. 市场环境过滤（调用 market_gate 模块）
 3. 纯技术分析（缩量回踩MA5等规则）
-4. 观察池维护（趋势破坏自动剔除）
+4. 选股名单当日跳过（趋势破坏/负面清单，仅影响当日结果，次日名单随新一轮妙想选股自然更新）
 
 拦截层（自下而上，越靠下越"硬"）：
 - market_gate：市场环境层，硬拦截时不开仓
 - veto_rules：负面清单（9 条硬否决），任一触发即不进信号池、不看评分
-- removal_rules：趋势破坏剔除（连续2天跌破10日线等）
+- skip_rules：趋势破坏跳过（连续2天跌破10日线等）
 - signal_detector：买点形态 + 信号质量门（情绪过热等）
 
 核心策略：
 - 买点：主升中的缩量回踩MA5（不破5日线 + 换手率>5%）
 - 不做：加速追高、情绪高潮接力、连续大阳后追涨
 - 环境过滤：见 strategy/market.md
-- 趋势不走坏即保留，连续2天跌破10日线才剔除
+- 选股名单每天由妙想选股重新生成：选股条件是信号触发条件的截面必要子集，
+  票在"变得可买的那天"必然进入名单，无需名单记忆。
+  持仓不受影响：卖出由 trend_sell.py 负责
 
 使用方式：
     python trend_analysis.py                    # 正常运行
@@ -54,24 +56,34 @@ from src.trend.analyzer import StockTrendAnalyzer
 from src.trend.entry_tier import (
     TIER_TIGHT, resolve_tier, screen_by_tier, tier_rule,
 )
-from src.trend.removal_rules import (
-    RemovalStats, check_removal_rules, check_removal_rules_detail,
+from src.trend.skip_rules import (
+    SkipStats, check_skip_rules_detail,
 )
 from src.trend.veto_rules import (
-    ACTION_REMOVE, check_external_veto, check_market_veto, fetch_main_net_inflow,
+    check_external_veto, check_market_veto, fetch_main_net_inflow,
+    FROM_60D_LOW_MAX, TURNOVER_DAY_MAX,
 )
 from src.trend.signal_detector import (
-    UNKNOWN_SECTOR, TechnicalSignal, detect_pullback_signals,
+    UNKNOWN_SECTOR, TechnicalSignal, detect_pullback_signals, MA20_BIAS_MAX,
 )
 from src.trend.report import generate_technical_report
 setup_env()
 
 logger = logging.getLogger(__name__)
 
-# 松筛默认关键词：宽松条件，保证池子不会饿死。精筛由 signal_detector 负责。
+# 妙想选股默认关键词：生成当日选股名单的"状态层"条件（截面状态，一次批量查询可得）。
+# 分层原则：截面状态 → 妙想选股；事件/路径（公告、资金流、大跌统计）→ veto_rules；
+# 盘中形态（下影线、量比、收盘位置）→ signal_detector。
+# 阈值单一来源：换手当日上限与 V3 同源（口径不同）、乖离与信号1条件⑥同源、
+# 60日位置与 V7 同源，均引用各规则模块常量。
+# 精筛由 signal_detector 负责；信号层保留同阈值防御性复查。
+# 实测妙想可正常解析全部子句。
 DEFAULT_SCREEN_KEYWORD = (
-    "市值大于30亿小于500亿；均线多头排列；换手率大于3%；"
-    "不要科创板不要创业板不要北交所不要ST"
+    f"总市值大于30亿小于500亿，5日均线大于10日均线大于20日均线，"
+    f"当日换手率大于3%小于{TURNOVER_DAY_MAX:g}%，"
+    f"收盘价距20日均线乖离率小于{MA20_BIAS_MAX:g}%，"
+    f"距离最近60日最低收盘价的涨幅小于{FROM_60D_LOW_MAX:g}%，"
+    "非科创板非创业板非北交所非ST"
 )
 
 
@@ -85,7 +97,7 @@ class SimpleTechnicalAnalyzer:
     def __init__(self):
         self.fetcher = DataFetcherManager()
         self.mx_service = MXService()
-        self.trend_analyzer = StockTrendAnalyzer()  # 复用 main.py 的技术指标计算
+        self.trend_analyzer = StockTrendAnalyzer()  # 复用 StockTrendAnalyzer 的均线计算
     
     def get_trading_dates(self, start_date: date, end_date: date) -> List[date]:
         from src.trading_calendar import get_trading_dates as _get_trading_dates
@@ -181,16 +193,16 @@ class SimpleTechnicalAnalyzer:
             )
         return UNKNOWN_SECTOR
 
-    def screen_new_candidates(self, keyword: str, page_size: int = 30) -> List[Tuple[str, str]]:
-        """MX 松筛发现新候选，返回 [(code, name), ...]
+    def mx_screen(self, keyword: str, page_size: int = 30) -> List[Tuple[str, str]]:
+        """执行妙想选股，返回 [(code, name), ...]
 
-        仅用于发现观察池新名字，不做精筛（精筛交给 signal_detector）。
+        仅做状态层粗筛（精筛由 signal_detector 负责），结果即当日选股名单。
         解析 MX 返回的中文列名，字段名可能带日期后缀，做防御式匹配。
         """
         try:
             rows, total = self.mx_service.screen_stocks(keyword, page_no=1, page_size=page_size)
             if not rows:
-                logger.warning(f"松筛无结果（关键词: {keyword}）")
+                logger.warning(f"妙想选股无结果（关键词: {keyword}）")
                 return []
             candidates = []
             for row in rows:
@@ -208,10 +220,10 @@ class SimpleTechnicalAnalyzer:
                 if code:
                     code = code.replace(".SH", "").replace(".SZ", "").replace(".BJ", "")
                     candidates.append((code, name or code))
-            logger.info(f"松筛返回 {total} 条，解析到 {len(candidates)} 个候选")
+            logger.info(f"妙想选股返回 {total} 条，解析到 {len(candidates)} 只")
             return candidates
         except Exception as e:
-            logger.warning(f"松筛失败: {e}")
+            logger.warning(f"妙想选股失败: {e}")
             return []
 
     def analyze_all_stocks(self, stock_list: List[Tuple[str, str]], 
@@ -221,11 +233,11 @@ class SimpleTechnicalAnalyzer:
                                      List[Tuple[str, str, str]],
                                      List[Tuple[str, str, str]],
                                      List[Tuple[str, str, str, str]],
-                                     RemovalStats]:
+                                     SkipStats]:
         """
-        分析所有关注股票，返回技术信号列表、剔除列表、失败列表、否决列表与剔除规则统计
+        分析选股名单，返回技术信号列表、趋势破坏跳过列表、失败列表、否决列表与跳过规则统计
 
-        准入顺序：剔除规则（趋势破坏） → 负面清单行情类否决 → 买点信号检测
+        准入顺序：跳过规则（趋势破坏） → 负面清单行情类否决 → 买点信号检测
                   → 负面清单外部数据类否决（仅信号候选）
 
         Args:
@@ -235,17 +247,17 @@ class SimpleTechnicalAnalyzer:
 
         Returns:
             (技术信号列表,
-             [(code, name, 剔除原因), ...],
+             [(code, name, 跳过原因), ...],
              [(code, name, 失败原因), ...],
              [(code, name, 否决动作, 否决原因), ...],
-             剔除规则逐条统计 RemovalStats)
-             否决动作为 ACTION_SKIP（仅跳过当日信号）或 ACTION_REMOVE（剔除自选池）
+             跳过规则逐条统计 SkipStats)
+             否决动作统一为跳过当日信号
         """
         all_signals = []
-        removed_stocks = []
+        skipped_stocks = []
         failed_stocks = []
         vetoed_stocks = []
-        stats = RemovalStats()
+        stats = SkipStats()
 
         if max_stocks and len(stock_list) > max_stocks:
             if sort_by_pct:
@@ -263,18 +275,22 @@ class SimpleTechnicalAnalyzer:
             try:
                 df = self.fetch_stock_data(code)
 
-                # 统一计算 MA，避免在剔除检查和信号检测中重复计算
+                # 统一计算 MA，避免在跳过检查和信号检测中重复计算
                 if df is not None and len(df) >= 10:
                     df = df.sort_values('date').reset_index(drop=True)
                     df = self.trend_analyzer._calculate_mas(df)
 
-                # 逐条跑完 4 条规则：既给出剔除结论，也累积「检查 N 只 / 触发 N 只」统计
-                checks = check_removal_rules_detail(code, df)
+                # 逐条跑完 4 条规则：既给出跳过结论，也累积「检查 N 只 / 触发 N 只」统计。
+                # 短路结论直接从明细取第一个触发项（与 check_skip_rules 等价），
+                # 避免重跑一遍规则导致统计日志重复输出。
+                checks = check_skip_rules_detail(code, df)
                 stats.record(f"{name}({code})", checks)
-                should_remove, remove_reason = check_removal_rules(code, df)
-                if should_remove:
-                    removed_stocks.append((code, name, remove_reason))
-                    logger.info(f"❌ 剔除 {name}({code}): {remove_reason}")
+                should_skip, skip_reason = next(
+                    ((True, c.reason) for c in checks if c.triggered), (False, "")
+                )
+                if should_skip:
+                    skipped_stocks.append((code, name, skip_reason))
+                    logger.info(f"⏭️ 跳过 {name}({code}): {skip_reason}")
                     continue
 
                 # 负面清单（行情类）：任一规则触发即否决，不进信号池、不看评分
@@ -314,16 +330,15 @@ class SimpleTechnicalAnalyzer:
 
         all_signals.sort(key=lambda x: x.score, reverse=True)
 
-        veto_removed = sum(1 for v in vetoed_stocks if v[2] == ACTION_REMOVE)
-        kept_count = len(stock_list) - len(removed_stocks) - len(vetoed_stocks) - len(failed_stocks)
+        kept_count = len(stock_list) - len(skipped_stocks) - len(vetoed_stocks) - len(failed_stocks)
         logger.info(
-            f"处理完成 | 保留:{kept_count} 剔除:{len(removed_stocks)} "
-            f"负面清单否决:{len(vetoed_stocks)}(其中剔除自选池{veto_removed}) "
+            f"处理完成 | 保留:{kept_count} 跳过:{len(skipped_stocks)} "
+            f"负面清单否决:{len(vetoed_stocks)} "
             f"失败:{len(failed_stocks)} 信号:{len(all_signals)}"
         )
-        # 逐条输出剔除规则的检查/触发统计（让"剔除 N 只"可解释、未实现项可见）
+        # 逐条输出跳过规则的检查/触发统计（让"跳过 N 只"可解释、未实现项可见）
         stats.log_summary()
-        return all_signals, removed_stocks, failed_stocks, vetoed_stocks, stats
+        return all_signals, skipped_stocks, failed_stocks, vetoed_stocks, stats
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -348,7 +363,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '--stocks',
         type=str,
-        help='指定要分析的股票代码，逗号分隔（覆盖妙想自选股）'
+        help='指定要分析的股票代码，逗号分隔（覆盖当日选股名单）'
     )
 
     parser.add_argument(
@@ -359,22 +374,16 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        '--no-screen',
-        action='store_true',
-        help='不执行松筛选股（默认在非 --stocks 模式下自动执行，往自选池补充新候选）'
-    )
-
-    parser.add_argument(
         '--screen-keyword',
         type=str,
         default=None,
-        help='松筛选股关键词（默认使用内置宽松条件，可用 SMART_SCREEN_KEYWORD 覆盖）'
+        help='妙想选股条件关键词（默认使用内置选股条件，可用 SMART_SCREEN_KEYWORD 覆盖）'
     )
 
     parser.add_argument(
         '--list',
         action='store_true',
-        help='仅列出当前自选池，不执行分析'
+        help='仅列出当日妙想选股名单，不执行分析'
     )
 
     trade_group = parser.add_argument_group('交易模式（可选）')
@@ -397,20 +406,22 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _list_self_selected(analyzer: 'SimpleTechnicalAnalyzer') -> int:
-    """列出当前妙想自选池。"""
-    try:
-        stock_codes, name_mapping = analyzer.mx_service.fetch_self_selected()
-        if not stock_codes:
-            logger.info("当前自选池为空")
-            return 0
-        logger.info(f"当前自选池共 {len(stock_codes)} 只:")
-        for code in stock_codes:
-            logger.info(f"  {code} {name_mapping.get(code, '')}")
+def _screen_keyword(args) -> str:
+    """解析妙想选股关键词：命令行参数 > 环境变量 > 内置默认。"""
+    return args.screen_keyword or os.getenv('SMART_SCREEN_KEYWORD') or DEFAULT_SCREEN_KEYWORD
+
+
+def _list_mx_screen(analyzer: 'SimpleTechnicalAnalyzer', keyword: str) -> int:
+    """列出当日妙想选股名单，不执行分析。"""
+    logger.info(f"执行妙想选股: {keyword}")
+    candidates = analyzer.mx_screen(keyword)
+    if not candidates:
+        logger.info("妙想选股无结果，名单为空")
         return 0
-    except Exception as e:
-        logger.error(f"获取自选池失败: {e}")
-        return 1
+    logger.info(f"当日选股名单共 {len(candidates)} 只:")
+    for code, name in candidates:
+        logger.info(f"  {code} {name}")
+    return 0
 
 
 def _fetch_held_codes() -> set:
@@ -476,71 +487,44 @@ def main():
     try:
         analyzer = SimpleTechnicalAnalyzer()
 
-        # 0. 列出自选池模式
+        # 0. 列出当日妙想选股名单模式
         if args.list:
-            logger.info("模式: 列出当前自选池")
-            return _list_self_selected(analyzer)
+            logger.info("模式: 列出当日妙想选股名单")
+            return _list_mx_screen(analyzer, _screen_keyword(args))
 
         max_stocks = args.max_stocks
         if max_stocks is None:
             max_stocks = int(os.getenv('MAX_STOCKS_PER_DAY', '0')) or None
         
-        # 1. 获取股票列表（从妙想或命令行）
+        # 1. 获取股票列表（命令行指定 > 当日妙想选股名单）
         if args.stocks:
             # 使用命令行指定的股票
             stock_codes = [canonical_stock_code(c) for c in args.stocks.split(',') if c.strip()]
             name_mapping = {code: code for code in stock_codes}
             logger.info(f"使用指定股票列表: {stock_codes}")
         else:
-            # 从妙想获取当前自选池
-            stock_codes, name_mapping = analyzer.mx_service.fetch_self_selected()
-
-            # 1.5 松筛：发现新候选并补充进自选池（观察池发现环节，不做精筛）
-            if not args.no_screen:
-                keyword = args.screen_keyword or os.getenv('SMART_SCREEN_KEYWORD') or DEFAULT_SCREEN_KEYWORD
-                logger.info(f"执行松筛选股: {keyword}")
-                candidates = analyzer.screen_new_candidates(keyword)
-                if candidates:
-                    existing = set(stock_codes)
-                    new_codes = [c for c, _ in candidates if c not in existing]
-                    if new_codes:
-                        logger.info(f"发现 {len(new_codes)} 只新候选: {new_codes}")
-                        # 写入妙想自选池，并合并进待分析列表
-                        added = analyzer.mx_service.add_self_select(",".join(new_codes))
-                        if added:
-                            logger.info(f"已加入妙想自选池 {len(new_codes)} 只")
-                            for c, n in candidates:
-                                if c in new_codes:
-                                    stock_codes.append(c)
-                                    name_mapping[c] = n
-                        else:
-                            logger.warning("加入自选池失败，新候选本次不分析")
-                    else:
-                        logger.info("无新候选，池子已覆盖")
-                else:
-                    logger.info("松筛无结果，跳过")
+            keyword = _screen_keyword(args)
+            logger.info(f"执行妙想选股: {keyword}")
+            candidates = analyzer.mx_screen(keyword)
+            if candidates:
+                stock_codes = [c for c, _ in candidates]
+                name_mapping = {c: n for c, n in candidates}
+                logger.info(f"当日选股名单 {len(stock_codes)} 只")
+            else:
+                logger.warning("妙想选股无结果，名单为空")
 
         if not stock_codes:
             logger.error("没有获取到股票列表，退出")
             return 1
         
-        # 2. 技术分析（包含剔除检查）
+        # 2. 技术分析（包含跳过检查）
         stock_list = list(zip(stock_codes, [name_mapping.get(c, c) for c in stock_codes]))
-        logger.info(f"当前关注列表: {len(stock_list)} 只股票")
+        logger.info(f"待分析列表: {len(stock_list)} 只股票")
 
-        signals, removed_stocks, failed_stocks, vetoed_stocks, removal_stats = analyzer.analyze_all_stocks(
+        signals, skipped_stocks, failed_stocks, vetoed_stocks, skip_stats = analyzer.analyze_all_stocks(
             stock_list, max_stocks=max_stocks, sort_by_pct=False
         )
 
-        # 3. 从妙想删除剔除的股票（趋势破坏 + 负面清单极端过热类；命令行指定模式不删）
-        codes_to_remove = [code for code, _, _ in removed_stocks]
-        codes_to_remove += [c for c, _, action, _ in vetoed_stocks if action == ACTION_REMOVE]
-        if codes_to_remove and not args.stocks:
-            success = analyzer.mx_service.remove_stocks(codes_to_remove)
-            if success:
-                logger.info(f"已从妙想删除 {len(codes_to_remove)} 只自选股")
-            else:
-                logger.warning("从妙想删除失败")
         
         # 4. 市场环境检查 + 调节信号评分（入口取数 → 纯判定）
         gate_inputs = fetch_gate_inputs(analyzer.fetcher)
@@ -582,11 +566,11 @@ def main():
                 logger.info(f"抑制 {len(signals) - len(filtered)} 只持仓股票的买入信号")
             signals = filtered
 
-        report = generate_technical_report(signals, removed_stocks,
+        report = generate_technical_report(signals, skipped_stocks,
                                            market_env=(can_trade, market_conditions, market_summary, market_regime),
                                            failed_stocks=failed_stocks,
                                            vetoed_stocks=vetoed_stocks,
-                                           removal_stats=removal_stats,
+                                           skip_stats=skip_stats,
                                            regime_diag=regime_diag,
                                            tier_blocked=tier_blocked)
 

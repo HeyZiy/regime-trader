@@ -7,8 +7,8 @@ style_report.py     → 风格状态周报：周度判定 主线强势期/退潮
                        落盘 data/style_state.json；--backtest 历史回放验证标签
 
 src/trend/                       ← 趋势策略全链路：分析器(analyzer)、信号检测(signal_detector)、
-                                   负面清单硬否决(veto_rules，9条规则，位于剔除规则与信号检测之间)、
-                                   剔除规则(removal_rules)、卖出规则(sell_rules，只判定不下单)、
+                                   负面清单硬否决(veto_rules，9条规则，位于跳过规则与信号检测之间)、
+                                   跳过规则(skip_rules)、卖出规则(sell_rules，只判定不下单)、
                                    日报生成(report，买入侧)
 trend_sell.py                    ← 尾盘卖出任务(14:45)：读妙想持仓→sell_rules 判定→
                                    自动下模拟仓市价单→自出成交报告并推送
@@ -35,11 +35,10 @@ python style_report.py --backtest 2021-01-01  # 历史回放状态时间线（�
 # 趋势交易（每交易日：14:45 卖出执行 + 15:10 买入分析）
 python trend_sell.py                        # 尾盘卖出：检测→自动下模拟仓市价单→出成交报告并推送
 python trend_sell.py --dry-run              # 只检测不下单（调试用）
-python trend_analysis.py                    # 日度分析（买入信号 + 剔除/负面清单；不含卖出）
-python trend_analysis.py --no-screen        # 跳过松筛，只分析当前自选池
-python trend_analysis.py --screen-keyword "..."  # 自定义松筛条件
-python trend_analysis.py --stocks 000001,600519  # 指定股票（覆盖妙想自选股）
-python trend_analysis.py --list             # 仅列出自选池
+python trend_analysis.py                    # 日度分析（选股名单=当日妙想选股结果，不读妙想自选）
+python trend_analysis.py --screen-keyword "..."  # 自定义妙想选股条件
+python trend_analysis.py --stocks 000001,600519  # 指定股票（覆盖当日选股名单）
+python trend_analysis.py --list             # 仅列出当日妙想选股名单
 python trend_analysis.py --debug --no-notify
 
 # ETF 长期配置（每周一 9:35）

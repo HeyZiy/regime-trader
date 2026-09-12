@@ -14,6 +14,8 @@ from typing import List, Optional
 
 import pandas as pd
 
+from src.trend.veto_rules import FROM_60D_LOW_MAX
+
 logger = logging.getLogger(__name__)
 
 # 板块取不到时的显式占位符。
@@ -22,6 +24,10 @@ UNKNOWN_SECTOR = "未知板块"
 
 # 信号类型白名单。新增买点形态时必须在此登记，并同步补 report._build_action_guide 的操作指引。
 KNOWN_SIGNAL_TYPES = ("pullback_ma5", "pullback_ma10", "near_ma5")
+
+# MA20 乖离上限(%)：信号 1 条件⑥。妙想选股语句（trend_analysis.DEFAULT_SCREEN_KEYWORD）
+# 引用本常量，此处为防御性复查（妙想选股为自然语言接口，解析口径可能漂移）。
+MA20_BIAS_MAX = 15.0
 
 
 class SignalFieldError(ValueError):
@@ -47,7 +53,7 @@ class TechnicalSignal:
 
     Attributes:
         sector: 所属板块名称，取不到时为 UNKNOWN_SECTOR
-        position_gain: 本轮起点涨幅（%），距近 60 日最低收盘的涨幅（与 veto V7 同口径）。
+        position_gain: 距近 60 日最低收盘价的涨幅（%），与 veto V7 同口径。
             开仓档位收紧（基础/半收紧/收紧）的判定输入，见 src/trend/entry_tier.py
         entry_tier: 市场状态对应的开仓档位（None = 不启用档位，禁止开仓）
         effective_score: 经市场环境档位登记后的有效评分（None = 未登记）
@@ -71,7 +77,7 @@ class TechnicalSignal:
 
     # ── 可选（有默认值）──
     sector: str = UNKNOWN_SECTOR  # 所属板块名称
-    position_gain: float = 0.0  # 本轮起点涨幅（%），档位收紧判定用
+    position_gain: float = 0.0  # 距近 60 日最低收盘价的涨幅（%），档位收紧判定用
     entry_tier: Optional[str] = None  # 开仓档位（None = 不启用档位）
     effective_score: Optional[int] = None  # 登记档位后的有效评分
     regime_note: str = ""  # 档位说明
@@ -333,13 +339,13 @@ def detect_pullback_signals(code: str, name: str, df: pd.DataFrame) -> List[Tech
     # 2. 不破5日线（或盘中破但尾盘收回）
     holds_ma5 = current_price >= ma5 * 0.995  # 允许微破
 
-    # 3. 选股池条件：换手率 > 3%（保证活跃度，缩量日允许适当降低）
+    # 3. 选股名单条件：换手率 > 3%（保证活跃度，缩量日允许适当降低）
     #    换手率缺失（数据源未提供）时视为「未知」：跳过该子条件放行并发告警，
     #    避免「默认0 → 永远挡掉所有信号」的静默黑屏（见 base._BACKFILL_COLUMNS）。
     _tr = latest.get('turnover_rate')
     turnover_unknown = _tr is None or pd.isna(_tr)
     turnover = 0.0 if turnover_unknown else float(_tr)
-    meets_liquidity = True if turnover_unknown else turnover > 3.0
+    meets_liquidity = turnover_unknown or turnover > 3.0
     if turnover_unknown:
         logger.warning(f"  {name}({code}): 换手率缺失，流动性子条件跳过（不因此挡单）")
 
@@ -366,17 +372,17 @@ def detect_pullback_signals(code: str, name: str, df: pd.DataFrame) -> List[Tech
         if pct_change > 7.0:
             is_euphoric = True
     # MA20 乖离过大：收盘偏离20日线过远，追高风险高
-    if bias_ma20 > 15.0:
+    # （MA20_BIAS_MAX 与妙想选股语句同源，此处防御性复查）
+    if bias_ma20 > MA20_BIAS_MAX:
         is_euphoric = True
 
-    # 4.4 位置维度：距近60日最低收盘涨幅（与 veto V7 统一口径）
+    # 4.4 位置维度：距近60日最低收盘涨幅（与 veto V7 同口径，单一来源引用其常量）
     #     涨幅≥80% → 信号失效（追高风险极高），<80% 时作为评分扣分维度（见 _position_penalty）
     low_60 = float(df['close'].tail(60).min())
     position_gain = (current_price - low_60) / low_60 * 100 if low_60 > 0 else 0.0
-    is_overextended = position_gain >= 80.0
+    is_overextended = position_gain >= FROM_60D_LOW_MAX
 
-    # 说明：原「妖股拦截」（近5日涨停≥3次）已迁入 veto_rules 的 V6（近20日涨跌停≥3天），
-    # 口径更宽且覆盖原条件（5日涨停3次必然满足20日涨跌停3天），此处不再重复判定。
+    # 涨停类拦截由 veto_rules 的 V6（近20日涨跌停≥3天）负责，此处不重复判定。
 
     # 5. 量能检查：当日成交量 < 5日均量 * 1.1（不允许爆量，而非必须地量）
     current_volume = latest['volume']
@@ -419,7 +425,7 @@ def detect_pullback_signals(code: str, name: str, df: pd.DataFrame) -> List[Tech
     if is_euphoric:
         _cond_fails.append(f"情绪过热(3d={recent_3d_gain:.1f}% 5d={recent_5d_gain:.1f}% 振幅={recent_max_amplitude:.1f}% 涨跌={pct_change:+.2f}% MA20乖离={bias_ma20:+.1f}%)")
     if is_overextended:
-        _cond_fails.append(f"距60日低点涨幅过大({position_gain:+.1f}%≥80%)")
+        _cond_fails.append(f"距60日低点涨幅过大({position_gain:+.1f}%≥{FROM_60D_LOW_MAX:g}%)")
     if not recently_above_ma5:
         _cond_fails.append("5天内<3天站在MA5之上")
     if not is_moderate_change:

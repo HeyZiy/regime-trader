@@ -17,9 +17,8 @@ from src.market_state.market_gate import RegimeDiagnosis
 from src.trend.entry_tier import (
     MIN_STOP_LOSS_PCT, position_size, resolve_tier, tier_rule,
 )
-from src.trend.removal_rules import REMOVAL_RULES, RemovalStats
+from src.trend.skip_rules import SKIP_RULES, SkipStats
 from src.trend.signal_detector import UNKNOWN_SECTOR, TechnicalSignal
-from src.trend.veto_rules import ACTION_REMOVE
 
 logger = logging.getLogger(__name__)
 
@@ -89,14 +88,14 @@ _SECTION_TITLES = {
     ),
     'near_ma5': (
         "## 👀 缩量贴MA5（观察 — 非买点，等回踩）",
-        "> 同一组 setup，但当日收涨未回踩：不追高，进观察池等回踩MA5企稳再接。",
+        "> 同一组 setup，但当日收涨未回踩：不追高，列入观察，等回踩MA5企稳再接。",
     ),
 }
 
 _PAIR_ROW = "| {stock} | {reason} |"
 _PAIR_HEADER = ("股票", "原因")
 
-# 剔除规则覆盖情况：逐条「检查 N 只 / 触发 N 只」，未实现的标注「未实现」
+# 跳过规则覆盖情况：逐条「检查 N 只 / 触发 N 只」，未实现的标注「未实现」
 _RULE_STAT_ROW = "| {rule} | {name} | {status} | {count} | {detail} |"
 _RULE_STAT_HEADER = ("规则", "内容", "状态", "检查/触发", "触发明细")
 
@@ -428,13 +427,13 @@ def _format_veto_section(vetoed_stocks: List[Tuple[str, str, str, str]]) -> List
     """生成负面清单否决板块。
 
     vetoed_stocks: [(code, name, action, reason), ...]
-    action: 'remove'（极端过热，已从自选池剔除）/ 'skip'（暂时性风险，仅跳过当日信号）
+    action: 统一为 'skip'（跳过当日信号）
     """
     lines = [
         "## 🚫 负面清单否决（不进信号池、不看评分）",
         "",
-        "> 极端过热类（V2 涨幅>100% / V6 涨跌停≥3天 / V7 距60日低点>80%）已剔除自选池；",
-        "> 暂时性风险类（V1 公告 / V3 高换手 / V4 连续大跌 / V5 资金流出 / V8 压力位）仅跳过当日信号，保留在池。",
+        "> 任一规则触发即跳过当日信号（V1 公告 / V2 涨幅>100% / V3 高换手 / V4 连续大跌 / "
+        "V5 资金流出 / V6 涨跌停≥3天 / V7 距60日低点>80% / V8 压力位）。",
         "",
     ]
 
@@ -443,41 +442,28 @@ def _format_veto_section(vetoed_stocks: List[Tuple[str, str, str, str]]) -> List
         lines.append("")
         return lines
 
-    def _table(rows: List[Tuple[str, str, str, str]]) -> List[str]:
-        out = _header(_PAIR_HEADER, _PAIR_ROW)
-        for code, name, _action, reason in rows[:20]:
-            out.append(_row(_PAIR_ROW, stock=f"{name}({code})", reason=reason))
-        if len(rows) > 20:
-            out.append(_row(_PAIR_ROW, stock="...", reason=f"等共{len(rows)}只股票"))
-        out.append("")
-        return out
-
-    removed = [v for v in vetoed_stocks if v[2] == ACTION_REMOVE]
-    skipped = [v for v in vetoed_stocks if v[2] != ACTION_REMOVE]
-
-    if removed:
-        lines.extend([f"**已剔除自选池（{len(removed)} 只）**", ""])
-        lines.extend(_table(removed))
-
-    if skipped:
-        lines.extend([f"**仅跳过当日信号（{len(skipped)} 只）**", ""])
-        lines.extend(_table(skipped))
-
+    lines.extend([f"**跳过当日信号（{len(vetoed_stocks)} 只）**", ""])
+    lines.extend(_header(_PAIR_HEADER, _PAIR_ROW))
+    for code, name, _action, reason in vetoed_stocks[:20]:
+        lines.append(_row(_PAIR_ROW, stock=f"{name}({code})", reason=reason))
+    if len(vetoed_stocks) > 20:
+        lines.append(_row(_PAIR_ROW, stock="...", reason=f"等共{len(vetoed_stocks)}只股票"))
+    lines.append("")
     return lines
 
 
-def _format_removal_stats_section(stats: Optional['RemovalStats']) -> List[str]:
-    """剔除规则覆盖情况表：逐条给出「检查 N 只 / 触发 N 只」。
+def _format_skip_stats_section(stats: Optional[SkipStats]) -> List[str]:
+    """跳过规则覆盖情况表：逐条给出「检查 N 只 / 触发 N 只」。
 
-    目的：让报告里的"剔除 N 只"这个数字可解释——用户能看到每条规则跑没跑、
+    目的：让报告里的"跳过 N 只"这个数字可解释——用户能看到每条规则跑没跑、
     跑了多少只，而不是只看到一个总数。
     未实现的规则显式标注「未实现」，绝不让它显示成"检查 0 只 / 触发 0 只"
     （那会被读成"规则跑了，股票没问题"）。
     """
     lines = [
-        "## 🔍 剔除规则覆盖情况",
+        "## 🔍 跳过规则覆盖情况",
         "",
-        "> 逐条列出四项已实现规则 + 未实现项的实际执行情况。"
+        "> 逐条列出各规则的实际执行情况。"
         "「跳过」= 数据缺失该条没跑，不等于股票没问题。",
         "",
     ]
@@ -485,7 +471,7 @@ def _format_removal_stats_section(stats: Optional['RemovalStats']) -> List[str]:
 
     if stats is None:
         # 没有统计数据时，用规则定义本身渲染，保证"未实现"仍然可见
-        for r in REMOVAL_RULES:
+        for r in SKIP_RULES:
             status = "未实现" if not r.implemented else "未统计"
             lines.append(_row(
                 _RULE_STAT_ROW, rule=r.rule_id, name=r.name, status=status,
@@ -510,7 +496,7 @@ def _format_removal_stats_section(stats: Optional['RemovalStats']) -> List[str]:
     return lines
 
 
-def _format_regime_diagnosis(diag: Optional['RegimeDiagnosis']) -> List[str]:
+def _format_regime_diagnosis(diag: Optional[RegimeDiagnosis]) -> List[str]:
     """状态判定的诊断明细：均线排列 + 偏离 MA20 百分比 + 命中路径。
 
     回答"为什么判成这个状态"，而不是只丢一个状态名给用户猜。
@@ -543,7 +529,7 @@ def _format_headline(signals: List[TechnicalSignal], removed_stocks, vetoed_stoc
         "",
     ]
     if not signals:
-        lines.extend(["> 📭 **今日无信号**：全池无标的触发回踩买点。", ""])
+        lines.extend(["> 📭 **今日无信号**：选股名单中无标的触发回踩买点。", ""])
     elif qualified == 0:
         # 有信号但一个都没达标：必须说清"不是没跑，是都不够格"
         lines.extend([
@@ -555,7 +541,7 @@ def _format_headline(signals: List[TechnicalSignal], removed_stocks, vetoed_stoc
         lines.extend([f"> ✅ 可进入 T+1 观察名单：**{qualified}** 只。", ""])
 
     lines.extend([
-        f"> 剔除 **{len(removed_stocks)}** 只 | 负面清单否决 **{len(vetoed_stocks)}** 只 | "
+        f"> 跳过（趋势破坏）**{len(removed_stocks)}** 只 | 负面清单 **{len(vetoed_stocks)}** 只 | "
         f"失败 **{len(failed_stocks)}** 只",
         "",
         "---",
@@ -571,8 +557,8 @@ def generate_technical_report(
     failed_stocks = None,
     vetoed_stocks = None,
     detail_level: str = "standard",
-    removal_stats: Optional['RemovalStats'] = None,
-    regime_diag: Optional['RegimeDiagnosis'] = None,
+    skip_stats: Optional[SkipStats] = None,
+    regime_diag: Optional[RegimeDiagnosis] = None,
     tier_blocked = None,
 ) -> str:
     """
@@ -582,8 +568,8 @@ def generate_technical_report(
     或传入字段与占位符不匹配，都会抛 ValueError 而不是产出静默错位的表格。
 
     报告结构（自上而下 = 决策优先级）：
-        头条结论 → 市场环境（含状态判定明细）→ 剔除规则覆盖
-        → 剔除名单 → 负面清单 → 分析失败 → 信号明细 → T+1 操作计划
+        头条结论 → 市场环境（含状态判定明细）→ 跳过规则覆盖
+        → 趋势破坏跳过 → 负面清单 → 分析失败 → 信号明细 → T+1 操作计划
 
 
     Args:
@@ -593,7 +579,7 @@ def generate_technical_report(
         failed_stocks: (code, name, reason) 元组列表
         vetoed_stocks: (code, name, action, reason) 元组列表，action 见 veto_rules
         detail_level: "compact"（通知精简）| "standard"（文件标准）| "full"（完整含操作计划）
-        removal_stats: 剔除规则逐条统计（RemovalStats）
+        skip_stats: 跳过规则逐条统计（SkipStats）
         regime_diag: 市场状态判定明细（RegimeDiagnosis）
         tier_blocked: (code, name, reason) 元组列表，被开仓档位收紧规则拦下的候选
 
@@ -663,13 +649,13 @@ def generate_technical_report(
         if tier_blocked:
             lines.extend(_format_tier_block_section(tier_blocked))
 
-    # 剔除规则覆盖情况：逐条「检查 N 只 / 触发 N 只」，未实现项显式标注
-    lines.extend(_format_removal_stats_section(removal_stats))
+    # 跳过规则覆盖情况：逐条「检查 N 只 / 触发 N 只」，未实现项显式标注
+    lines.extend(_format_skip_stats_section(skip_stats))
 
-    # 剔除股票
+    # 趋势破坏跳过
     if removed_stocks:
         lines.extend([
-            "## ❌ 剔除股票（趋势破坏）",
+            "## ⏭️ 跳过股票（趋势破坏）",
             "",
         ])
         lines.extend(_header(_PAIR_HEADER, _PAIR_ROW))
