@@ -49,7 +49,7 @@ CORE_BASELINE: List[AssetAllocation] = [
     # ── 海外 ──
     AssetAllocation("513100", "纳指ETF",                AssetType.EQUITY, 0.05, 9),
     AssetAllocation("513500", "标普500ETF",              AssetType.EQUITY, 0.05, 9),
-    AssetAllocation("513380", "恒生ETF",                AssetType.EQUITY, 0.10, 5),
+    AssetAllocation("513380", "恒生科技ETF",            AssetType.EQUITY, 0.10, 5),
     # ── 行业/主题 ──
     AssetAllocation("159938", "医药ETF",                AssetType.EQUITY, 0.04, 4),
     AssetAllocation("516560", "养老ETF",                AssetType.EQUITY, 0.02, 7),
