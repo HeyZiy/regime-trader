@@ -8,7 +8,7 @@ ETF 周度观察报告 — 估值导向
 
 报告结构：
   1. 市场估值概览（纯数据：全市场 PE / 收益率 / 风险溢价及其分位，不给操作建议）
-  2. 买入优先级（按 PE 分位排序，参考信息）
+  2. 各标的估值参考（锚对准跟踪指数当前 PE/股息率，跨标的不可比，仅展示）
   3. 新钱投放参考（全局节奏熔断 + 逐标的补入节奏，仅建议，真实账户人工执行）
   4. 持仓对照与调仓建议（核心口径，旧钱只做阈值再平衡）
   5. 卫星仓 — 行业动量轮动（关注池 + 突破候选 + 调仓建议）
@@ -33,7 +33,7 @@ from src.trading_calendar import is_trading_day
 
 setup_env()
 
-from src.etf.config import CORE_BASELINE, AssetType
+from src.etf.config import CORE_BASELINE, AssetType, DIVIDEND_STYLE_CODES
 from src.etf.amazing_factors import (
     get_market_pe, get_treasury_yield_y10, get_erp_percentile,
     rank_buy_priorities, check_sell_warnings,
@@ -43,10 +43,14 @@ from src.mx.client import is_mx_untradable
 logger = logging.getLogger(__name__)
 
 # ── 新钱全局节奏（极端熔断）阈值 ──
-# 常态不表态：权益/现金整体配比观点归基准（只抄基准不抄择时），新钱默认按比例并入。
+# 常态不表态：按比例并入即默认答案，权益/现金整体配比观点归基准（只抄基准不抄择时），
 # 仅在极端估值档整笔暂缓——与卖出警示/卫星锁仓同属熔断家族，非连续择时旋钮。
 GLOBAL_PAUSE_PE_PCT = 90.0   # 全市场 PE 分位（与 check_sell_warnings 同阈值）
 GLOBAL_PAUSE_ERP_PCT = 10.0  # 风险溢价自身近 5 年分位
+GLOBAL_BOOST_PE_PCT = 30.0   # 全市场 PE 分位 ≤ 此值 → 整体便宜档，可适当加速并入
+# 红利类（股息策略）新钱加速阈值：股息率 − 10Y 国债 ≥ 此值(pt) 视同低估。
+# 绝对阈值为过渡口径（股息率自身分位历史积累后可切换；注意股息率分位语义反转：高位=便宜）
+DIV_SPREAD_ACCEL = 1.5
 
 
 # ── 风格状态引用（元层观察，fail-soft，只展示不决策）──
@@ -115,8 +119,8 @@ def _market_overview() -> str:
 # ── 买入优先级 ──
 
 def _buy_priority() -> str:
-    """买入优先级（按 PE 分位排序，越便宜越靠前）"""
-    lines = ["## 二、买入优先级（按估值便宜度排序）", ""]
+    """各标的估值参考（锚对准跟踪指数；PE 跨标的不可比，仅看各自锚的水平）"""
+    lines = ["## 二、各标的估值参考（锚对准跟踪指数，PE 跨标的不可比）", ""]
 
     # 收集所有核心仓权益 ETF（去重）
     equity_etfs = {}
@@ -126,16 +130,15 @@ def _buy_priority() -> str:
 
     ranked = rank_buy_priorities(list(equity_etfs.values()))
 
-    lines.append("| ETF | 估值基准 | PE 分位 | 建议 |")
-    lines.append("|-----|---------|--------|------|")
+    lines.append("| ETF | 估值锚 | PE | 股息率 | 备注 |")
+    lines.append("|-----|--------|-----|--------|------|")
 
     for r in ranked:
         source = r.get("source_name", "") or "—"
-        pe_display = f"{r['pe_pct']:.0f}%" if r.get("pe_pct") is not None else "—"
-        lines.append(
-            f"| {r['name']}（{r['code']}） | {source} | {pe_display} | "
-            f"{r['level']} {r['level_text']} |"
-        )
+        pe = f"{r['pe']:.1f}" if r.get("pe") is not None else "—"
+        dy = f"{r['div_yield']:.1f}%" if r.get("div_yield") is not None else "—"
+        note = r.get("level_text", "") or "—"
+        lines.append(f"| {r['name']}（{r['code']}） | {source} | {pe} | {dy} | {note} |")
 
     lines.append("")
     return "\n".join(lines)
@@ -347,11 +350,11 @@ def _holding_overview(alloc=None) -> str:
 
 
 def _global_rhythm_line() -> str:
-    """新钱全局节奏行：回答"要不要整体先等等"。
+    """新钱全局节奏行：回答"要不要整体先等等 / 要不要整体加速"。
 
     常态不表态——按比例并入即默认答案，权益/现金整体配比观点归基准（只抄基准不抄择时）。
-    仅极端估值熔断：全市场 PE 分位 ≥ GLOBAL_PAUSE_PE_PCT（与卖出警示同阈值），
-    或风险溢价自身近 5 年分位 ≤ GLOBAL_PAUSE_ERP_PCT（跨资产口径的独立确认）。
+    双向极端档共用全市场序列：暂缓档（PE 分位 ≥ GLOBAL_PAUSE_PE_PCT 与卖出警示同阈值，
+    或风险溢价自身近 5 年分位 ≤ GLOBAL_PAUSE_ERP_PCT）；便宜档（PE 分位 ≤ GLOBAL_BOOST_PE_PCT）。
     """
     market_pe = get_market_pe()
     if not market_pe:
@@ -374,6 +377,9 @@ def _global_rhythm_line() -> str:
         return (f"> ⚠️ **全局节奏：暂缓并入**（{'；'.join(triggers)}）。"
                 f"新钱留在场外，等分位回落或分批；下表 🟢 仅为若必须并入时的相对优先级。")
     erp_txt = f"，风险溢价分位 {erp_pct:.0f}%" if erp_pct is not None else ""
+    if pe_pct <= GLOBAL_BOOST_PE_PCT:
+        return (f"> 🟢 **全局节奏：整体偏便宜**（全市场 PE 分位 {pe_pct:.0f}% ≤ {GLOBAL_BOOST_PE_PCT:.0f}%{erp_txt}）"
+                f"→ **可适当加速并入**，不必等回调。")
     return (f"> ✅ **全局节奏**：无极端信号（PE 分位 {pe_pct:.0f}%{erp_txt}）→ **按比例并入**，"
             f"下表只是篮子内的先后快慢，不改变整体配比。")
 
@@ -410,51 +416,57 @@ def _deploy_cash_section(alloc: dict) -> str:
         ret20 = (cur / float(close.iloc[-21]) - 1) * 100 if len(close) >= 21 else 0.0
         above_ma20 = cur >= float(ma20)
 
-        # 估值分位（ AmazingData，缺失不阻断）
-        pe_pct = None
-        try:
-            info = _etf_pe_info_safe(a.code)
-            pe_pct = info
-        except Exception:
-            pass
+        # 估值信息（锚对准跟踪指数，缺失不阻断）
+        info = _etf_valuation_info_safe(a.code)
+        pe_pct = info.get("pe_pct") if info else None
+        spread = info.get("div_yield_spread") if info else None
+        # 便宜判定：PE 分位 <30%，或红利类股息率利差达标（股息是红利策略的现金流本体）
+        cheap = ((pe_pct is not None and pe_pct < 30)
+                 or (spread is not None and spread >= DIV_SPREAD_ACCEL))
 
         # 节奏判定：趋势（右侧纪律）x 估值（便宜加速）
         if above_ma20:
-            rhythm = ("🟢 可正常补" if (pe_pct is None or pe_pct >= 30)
-                      else "🟢🟢 可加速（低估 + 企稳）")
+            rhythm = "🟢🟢 可加速（低估 + 企稳）" if cheap else "🟢 可正常补"
             basis = f"站上MA20，20日{ret20:+.1f}%"
         else:
             rhythm = "⏳ 不急：趋势向下，分批或等站回 MA20"
             basis = f"MA20下方，20日{ret20:+.1f}%"
         if pe_pct is not None and pe_pct < 20 and not above_ma20:
             rhythm = "🟡 极度低估：可分批加速，不必等企稳"
-        pe_txt = f"{pe_pct:.0f}%" if pe_pct is not None else "—"
+
+        if pe_pct is not None:
+            pe_txt = f"{pe_pct:.0f}%"
+        elif info and info.get("div_yield") is not None and a.code.zfill(6) in DIVIDEND_STYLE_CODES:
+            pe_txt = f"股息率{info['div_yield']:.1f}%" + (f" 利差{spread:+.1f}" if spread is not None else "")
+        elif info and info.get("pe") is not None:
+            pe_txt = f"PE{info['pe']:.1f}"
+        else:
+            pe_txt = "—"
         manual_mark = " ⚠️ 需手动" if is_mx_untradable(a.code) else ""
         rows.append((rhythm, f"| {a.name}({a.code}){manual_mark} | {pe_txt} | {basis} | {rhythm} |"))
 
     # 加速在前、不急在后
     rows.sort(key=lambda x: ("🟢🟢" not in x[0], "⏳" in x[0], "🟡" in x[0]))
-    lines.append("| 标的 | 估值分位(近5年) | 趋势 | 补入节奏 |")
+    lines.append("| 标的 | 估值(锚) | 趋势 | 补入节奏 |")
     lines.append("|---|---|---|---|")
     lines.extend(r for _, r in rows)
     lines.append("")
-    lines.append("> 分位口径：行业/主题 ETF 用其申万一级行业 PE；红利等未映射行业的标的回退全市场口径；海外 ETF 无估值数据。")
+    lines.append("> 估值口径：优先跟踪指数自身（中证官网当前 PE/股息率，不做历史分位——便宜判定收归全局节奏与红利利差）；"
+                 "红利类看股息率−10Y国债利差（≥1.5pt 视同低估加速）；未映射标的回退申万行业 PE 分位；全市场仅作兜底；海外无估值数据。"
+                 "PE 跨标的不可比，只看各自锚的水平。")
     lines.append("> 缺口金额自己算：入金后缺口 = 目标权重 x 总资产 - 实际市值；模拟仓的缺口见第四节再平衡对照。")
     lines.append("> 到账后在真实账户人工操作（妙想模拟仓只跑旧钱再平衡，与新钱无关），不自动执行。")
     lines.append("")
     return chr(10).join(lines)
 
 
-def _etf_pe_info_safe(code: str):
-    """单只 ETF 的行业 PE 分位（缺失返回 None）。"""
+def _etf_valuation_info_safe(code: str):
+    """单只 ETF 的估值信息（锚对准跟踪指数，缺失返回 None）。"""
     try:
         from src.etf.amazing_factors import _etf_pe_info
-        info = _etf_pe_info(code)
-        if info:
-            return info.get("pe_pct")
+        return _etf_pe_info(code)
     except Exception:
-        pass
-    return None
+        return None
 
 
 # ── 卫星仓与动量观察 ──

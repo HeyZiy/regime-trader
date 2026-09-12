@@ -8,6 +8,7 @@ AmazingData 因子封装层（ETF 周度观察专用）
 - 行业 PE/PB 历史分位（申万一级行业，2000 年至今）
 - 行业市值占比（拥挤度因子）
 - 10 年期国债收益率（股债性价比：风险溢价及其自身历史分位）
+- 中证指数官网估值（核心仓跟踪指数自身 PE/股息率，本地滚动累积历史供分位计算）
 
 设计原则：
 - 所有函数失败均返回 None/空值，绝不抛出异常 —— 调用方据此降级回旧逻辑
@@ -21,6 +22,8 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+
+from src.etf.config import TRACKED_INDEX, DIVIDEND_STYLE_CODES
 
 logger = logging.getLogger(__name__)
 
@@ -530,6 +533,67 @@ def get_erp_percentile(lookback: int = PERCENTILE_LOOKBACK) -> Optional[dict]:
         return None
 
 
+# ── 中证指数官网估值（跟踪指数当前 PE/股息率） ──
+
+# 官网 indicator 文件表头为中英双语（如 "日期Date"），按列位置解析
+_CSINDEX_COLS = ["date", "index_code", "index_name", "index_short",
+                 "en_full", "en_short", "pe", "pe2", "dy", "dy2"]
+_csindex_cache: Dict[str, Optional[dict]] = {}
+
+
+def _fetch_csindex_indicator(index_code: str) -> Optional[pd.DataFrame]:
+    """下载中证官网估值明细（仅含近 20 个交易日）。"""
+    url = (f"https://oss-ch.csindex.com.cn/static/html/csindex/public/uploads/file/autofile/"
+           f"indicator/{index_code}indicator.xls")
+    try:
+        df = pd.read_excel(url)
+        if df.shape[1] != len(_CSINDEX_COLS):
+            logger.warning(f"csindex 估值文件列数异常 {index_code}: {df.shape[1]}")
+            return None
+        df.columns = _CSINDEX_COLS
+        df = df[["date", "index_code", "index_name", "pe", "dy"]].copy()
+        df["date"] = df["date"].astype(str)
+        # 指数代码列会被读成整数（000922 → 922），补齐前导零
+        df["index_code"] = df["index_code"].astype(str).str.zfill(6)
+        for col in ("pe", "dy"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["pe"])
+        return df if not df.empty else None
+    except Exception as e:
+        logger.warning(f"csindex 估值下载失败 {index_code}: {e}")
+        return None
+
+
+def get_csindex_valuation(index_code: str) -> Optional[dict]:
+    """
+    跟踪指数自身估值的当前值（中证官网 PE/股息率，取最新一日）。
+
+    决策记录（2026-09）：不做历史分位积累。官网无历史文件、自建积累需约一年冷启动，
+    而逐指数分位唯一用途（新钱估值加速器）与趋势主规则、全局便宜档（全市场 PE 分位）
+    高度重叠，收益不抵维护成本。"便宜"判定收归两层：全局节奏（全市场口径）+
+    红利类股息率利差（跨资产口径，零历史依赖）。
+
+    Returns:
+        {'index_code','index_name','asof','pe','dy'} 或 None。dy = 股息率1（总股本口径）。
+    """
+    if index_code in _csindex_cache:
+        return _csindex_cache[index_code]
+
+    df = _fetch_csindex_indicator(index_code)
+    result = None
+    if df is not None:
+        latest = df.iloc[0]  # 官网明细按日期降序，首行为最新
+        result = {
+            "index_code": str(latest["index_code"]),
+            "index_name": str(latest["index_name"]),
+            "asof": str(latest["date"]),
+            "pe": round(float(latest["pe"]), 2),
+            "dy": round(float(latest["dy"]), 2) if pd.notna(latest["dy"]) else None,
+        }
+    _csindex_cache[index_code] = result
+    return result
+
+
 # ── ETF 买入优先级 & 卖出警示 ──
 
 # 海外 ETF（暂无 PE 数据，标"数据缺失"）
@@ -537,11 +601,33 @@ _OVERSEAS_CODES = frozenset({"513100", "513500", "513380"})
 
 
 def _etf_pe_info(etf_code: str) -> Optional[dict]:
-    """获取单只 ETF 的 PE 信息（行业 PE → 市场 PE → 海外无数据）。"""
+    """获取单只 ETF 的估值信息，锚对准买入标的本身。
+
+    口径优先级：跟踪指数自身估值（csindex 当前值，TRACKED_INDEX）→ 申万一级行业
+    PE 分位 → 全市场兜底。csindex 不提供分位（决策记录见 get_csindex_valuation），
+    仅行业/全市场等历史回退口径带 pe_pct。
+    """
     code = str(etf_code).zfill(6)
 
     if code in _OVERSEAS_CODES:
         return {"source_type": "overseas", "pe": None, "pe_pct": None, "source_name": "海外"}
+
+    index_code = TRACKED_INDEX.get(code)
+    if index_code:
+        val = get_csindex_valuation(index_code)
+        if val:
+            info = {
+                "pe": val.get("pe"), "pe_pct": None,
+                "source_type": "csindex",
+                "source_name": val.get("index_name") or index_code,
+            }
+            # 股息率与利差（股息率 − 10Y 国债，跨资产口径，零历史依赖）
+            if val.get("dy") is not None:
+                info["div_yield"] = val["dy"]
+                y10 = get_treasury_yield_y10()
+                if y10:
+                    info["div_yield_spread"] = round(val["dy"] - y10, 2)
+            return info
 
     industry = get_etf_industry(code)
     if industry:
@@ -559,29 +645,30 @@ def _etf_pe_info(etf_code: str) -> Optional[dict]:
 
 
 def rank_buy_priorities(etf_list) -> list:
-    """按估值便宜度（PE 分位升序）排列 ETF 买入优先级。"""
+    """各核心 ETF 的估值参考（跟踪指数锚当前值；仅申万行业/全市场等历史回退口径带分位）。"""
     results = []
     for etf in etf_list:
         info = _etf_pe_info(etf.code)
         pe_pct = info.get("pe_pct") if info else None
-        if pe_pct is None:
-            level, level_text = "", "— 无数据"
-        elif pe_pct < 20:
-            level, level_text = "⭐⭐⭐", "极度低估，优先关注"
-        elif pe_pct < 40:
-            level, level_text = "⭐⭐", "低估，值得关注"
-        elif pe_pct < 60:
-            level, level_text = "⭐", "估值合理偏低"
-        elif pe_pct < 80:
-            level, level_text = "", "中性偏贵，暂缓"
-        elif pe_pct < 90:
-            level, level_text = "", "偏贵，暂缓"
-        else:
-            level, level_text = "", "❌ 高估，回避"
+        level, level_text = "", ""
+        if pe_pct is not None:
+            level_text = ("⭐⭐⭐ 极度低估，优先关注" if pe_pct < 20 else
+                          "⭐⭐ 低估，值得关注" if pe_pct < 40 else
+                          "估值合理偏低" if pe_pct < 60 else
+                          "中性偏贵，暂缓" if pe_pct < 80 else
+                          "偏贵，暂缓" if pe_pct < 90 else
+                          "❌ 高估，回避")
+        elif str(etf.code).zfill(6) in DIVIDEND_STYLE_CODES and info:
+            if info.get("div_yield_spread") is not None:
+                level_text = f"利差 {info['div_yield_spread']:+.1f}pt（≥1.5 视同低估）"
+            elif info.get("div_yield") is not None:
+                level_text = "股息率口径"
         results.append({
             "code": etf.code, "name": etf.name,
             "pe": info.get("pe") if info else None,
             "pe_pct": pe_pct,
+            "div_yield": info.get("div_yield") if info else None,
+            "div_yield_spread": info.get("div_yield_spread") if info else None,
             "source_name": info.get("source_name", "") if info else "",
             "level": level, "level_text": level_text,
         })

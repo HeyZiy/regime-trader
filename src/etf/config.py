@@ -15,7 +15,7 @@ ETF 长期配置 — 中性基准
 """
 
 from dataclasses import dataclass
-from typing import List
+from typing import Dict, FrozenSet, List, Optional
 
 # ── 类别枚举 ──
 
@@ -62,6 +62,23 @@ CORE_BASELINE: List[AssetAllocation] = [
 
 # 再平衡模块使用核心仓位
 NEUTRAL_BASELINE = CORE_BASELINE
+
+# ── 核心仓 ETF 跟踪指数（估值锚对准买入标的本身） ──
+# 口径 = 中证指数官网估值（PE/股息率，见 amazing_factors.get_csindex_valuation），
+# 指数代码已逐只经官网实测核对（2026-09）。海外 ETF（513100/513500/513380）无 csindex
+# 数据；黄金为无现金流资产，不适用估值锚。红利类估值以股息率为主锚（股息是现金流本体）。
+TRACKED_INDEX: Dict[str, str] = {
+    "563360": "000510",  # A500ETF → 中证A500指数
+    "159680": "000852",  # 中证1000增强ETF → 中证1000指数
+    "515180": "000922",  # 红利ETF → 中证红利指数
+    "159938": "000991",  # 医药ETF → 中证全指医药卫生指数
+    "516560": "399812",  # 养老ETF → 中证养老产业指数
+    "159928": "000932",  # 消费ETF → 中证主要消费指数
+}
+
+# 股息策略类 ETF：估值以股息率为主锚（股息是现金流本体，PE/全市场口径易反向），
+# 新钱节奏用"股息率 − 10Y 国债利差"做加速判定（分位历史积累后可切换分位口径）。
+DIVIDEND_STYLE_CODES: FrozenSet[str] = frozenset({"515180"})
 
 # 减仓优先级：按 volatility_rank 从高到低（创业板先减，国债/现金后减）
 # gold 和 bond 在 trending_down/chaos/hard_intercept 时不减
