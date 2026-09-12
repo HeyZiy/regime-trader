@@ -7,9 +7,9 @@ ETF 周度观察报告 — 估值导向
 定位：每周一次，默认纯观察；`--execute` 时执行统一调仓批次。
 
 报告结构：
-  1. 市场估值概览（全市场 PE + 国债收益率，估值只服务新钱速度旋钮与参考）
+  1. 市场估值概览（纯数据：全市场 PE / 收益率 / 风险溢价及其分位，不给操作建议）
   2. 买入优先级（按 PE 分位排序，参考信息）
-  3. 新钱投放参考（固定输出：假如有新钱，按欠配度排序买这些，仅建议）
+  3. 新钱投放参考（全局节奏熔断 + 逐标的补入节奏，仅建议，真实账户人工执行）
   4. 持仓对照与调仓建议（核心口径，旧钱只做阈值再平衡）
   5. 卫星仓 — 行业动量轮动（关注池 + 突破候选 + 调仓建议）
   6. 动量观察（卫星仓背景排名，仅观察不交易）
@@ -35,12 +35,18 @@ setup_env()
 
 from src.etf.config import CORE_BASELINE, AssetType
 from src.etf.amazing_factors import (
-    get_market_pe, get_treasury_yield_y10,
+    get_market_pe, get_treasury_yield_y10, get_erp_percentile,
     rank_buy_priorities, check_sell_warnings,
 )
 from src.mx.client import is_mx_untradable
 
 logger = logging.getLogger(__name__)
+
+# ── 新钱全局节奏（极端熔断）阈值 ──
+# 常态不表态：权益/现金整体配比观点归基准（只抄基准不抄择时），新钱默认按比例并入。
+# 仅在极端估值档整笔暂缓——与卖出警示/卫星锁仓同属熔断家族，非连续择时旋钮。
+GLOBAL_PAUSE_PE_PCT = 90.0   # 全市场 PE 分位（与 check_sell_warnings 同阈值）
+GLOBAL_PAUSE_ERP_PCT = 10.0  # 风险溢价自身近 5 年分位
 
 
 # ── 风格状态引用（元层观察，fail-soft，只展示不决策）──
@@ -67,7 +73,7 @@ def _style_state_line() -> str:
 # ── 市场概览 ──
 
 def _market_overview() -> str:
-    """市场估值概览（仅列数据，不给操作建议）"""
+    """市场估值概览（纯数据展示，不给操作建议；整体配比观点归基准，新钱节奏见第三节）"""
     lines = ["## 一、市场估值概览", ""]
 
     market_pe = get_market_pe()
@@ -83,17 +89,19 @@ def _market_overview() -> str:
         y10 = get_treasury_yield_y10()
         if y10:
             spread = 100/pe - y10
+            # ERP 自身分位与 PE 分位同窗口可比：PE 分位受窗口锚定影响（含深熊底部则读高），
+            # ERP 分位是跨资产口径的独立参照，两者并列展示供互相印证
+            erp_note = ""
+            try:
+                erp = get_erp_percentile()
+            except Exception:
+                erp = None
+            if erp:
+                erp_note = f"，自身近 5 年 **{erp['erp_pct']:.0f}%** 分位"
             lines.append(
-                f"- **风险溢价**：{100/pe:.2f}% − 国债 {y10:.2f}% = **{spread:+.2f}%** "
+                f"- **风险溢价**：{100/pe:.2f}% − 国债 {y10:.2f}% = **{spread:+.2f}%**{erp_note} "
                 f"（{'承担风险有额外回报' if spread > 0 else '股票还不如国债'}）"
             )
-
-        if pe_pct < 30:
-            lines.append(f"- **定投节奏**：低估区间，可适当加量")
-        elif pe_pct < 70:
-            lines.append(f"- **定投节奏**：正常")
-        else:
-            lines.append(f"- **定投节奏**：偏贵区间，建议放缓、多留现金")
     else:
         lines.append("- **全市场 PE**：数据不可用")
         y10 = get_treasury_yield_y10()
@@ -338,17 +346,52 @@ def _holding_overview(alloc=None) -> str:
     return "\n".join(lines)
 
 
+def _global_rhythm_line() -> str:
+    """新钱全局节奏行：回答"要不要整体先等等"。
+
+    常态不表态——按比例并入即默认答案，权益/现金整体配比观点归基准（只抄基准不抄择时）。
+    仅极端估值熔断：全市场 PE 分位 ≥ GLOBAL_PAUSE_PE_PCT（与卖出警示同阈值），
+    或风险溢价自身近 5 年分位 ≤ GLOBAL_PAUSE_ERP_PCT（跨资产口径的独立确认）。
+    """
+    market_pe = get_market_pe()
+    if not market_pe:
+        return "> **全局节奏**：全市场估值数据不可用，默认按比例并入。"
+
+    pe_pct = market_pe["pe_pct"]
+    try:
+        erp = get_erp_percentile()
+    except Exception:
+        erp = None
+    erp_pct = erp.get("erp_pct") if erp else None
+
+    triggers = []
+    if pe_pct >= GLOBAL_PAUSE_PE_PCT:
+        triggers.append(f"全市场 PE 分位 {pe_pct:.0f}% ≥ {GLOBAL_PAUSE_PE_PCT:.0f}%")
+    if erp_pct is not None and erp_pct <= GLOBAL_PAUSE_ERP_PCT:
+        triggers.append(f"风险溢价处于自身近 5 年 {erp_pct:.0f}% 分位（≤{GLOBAL_PAUSE_ERP_PCT:.0f}%）")
+
+    if triggers:
+        return (f"> ⚠️ **全局节奏：暂缓并入**（{'；'.join(triggers)}）。"
+                f"新钱留在场外，等分位回落或分批；下表 🟢 仅为若必须并入时的相对优先级。")
+    erp_txt = f"，风险溢价分位 {erp_pct:.0f}%" if erp_pct is not None else ""
+    return (f"> ✅ **全局节奏**：无极端信号（PE 分位 {pe_pct:.0f}%{erp_txt}）→ **按比例并入**，"
+            f"下表只是篮子内的先后快慢，不改变整体配比。")
+
+
 def _deploy_cash_section(alloc: dict) -> str:
     """新钱投放参考（每周固定输出）：只回答节奏问题——什么可以加速补、什么不急着补。
 
     缺口补入不在本节：新钱入金后各资产自然欠配，按基准目标权重自行计算缺口买入即可
     （目标权重见第二节表）；模拟仓口径的缺口由旧钱再平衡（第四节）处理。
+    新钱为真实资金、独立于妙想模拟仓，到账后人工在真实账户操作。
     """
     from data_provider import get_etf_daily
 
     lines = ["## 三、新钱投放参考（节奏判断，仅建议）", ""]
     lines.append("入金后按基准目标权重补入即可（缺口 = 目标权重 x 入金后总资产 - 实际市值）。")
-    lines.append("本节只回答：哪些不急着补、哪些可以加速。")
+    lines.append("本节先给全局节奏（要不要整体等等），再给逐标的节奏（哪些不急着补、哪些可以加速）。")
+    lines.append("")
+    lines.append(_global_rhythm_line())
     lines.append("")
 
     rows = []
@@ -391,12 +434,13 @@ def _deploy_cash_section(alloc: dict) -> str:
 
     # 加速在前、不急在后
     rows.sort(key=lambda x: ("🟢🟢" not in x[0], "⏳" in x[0], "🟡" in x[0]))
-    lines.append("| 标的 | 行业PE分位 | 趋势 | 补入节奏 |")
+    lines.append("| 标的 | 估值分位(近5年) | 趋势 | 补入节奏 |")
     lines.append("|---|---|---|---|")
     lines.extend(r for _, r in rows)
     lines.append("")
+    lines.append("> 分位口径：行业/主题 ETF 用其申万一级行业 PE；红利等未映射行业的标的回退全市场口径；海外 ETF 无估值数据。")
     lines.append("> 缺口金额自己算：入金后缺口 = 目标权重 x 总资产 - 实际市值；模拟仓的缺口见第四节再平衡对照。")
-    lines.append("> 到账后人工在妙想 App 操作，不自动执行。")
+    lines.append("> 到账后在真实账户人工操作（妙想模拟仓只跑旧钱再平衡，与新钱无关），不自动执行。")
     lines.append("")
     return chr(10).join(lines)
 
