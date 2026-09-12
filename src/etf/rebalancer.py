@@ -7,13 +7,13 @@ ETF 再平衡引擎
 职责：
 1. 中性基准 → 目标配比（无偏移，动态择时已删除，见 strategy/etf_allocation.md）
 2. 比较 mx-moni 实际持仓 vs 目标 → 生成调仓指令（旧钱唯一动作）
-3. 执行调仓（通过 mx-moni 交易接口）
+3. 执行由 etf_observe --execute 统一批次完成（本模块只出指令）
 
-新钱投放参考（欠配度排序）由 etf_observe 报告生成，仅建议不自动执行。
+新钱投放参考（全局节奏 + 逐标的节奏）由 etf_observe 报告生成，仅建议不自动执行。
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from src.etf.config import (
@@ -36,18 +36,6 @@ class RebalanceOrder:
     current_pct: float  # 当前占比
     target_pct: float   # 目标占比
     reason: str         # 原因
-
-
-@dataclass
-class AllocationReport:
-    date: str
-    gate_state: str
-    hard_intercept: bool
-    total_assets: float
-    target_allocations: List[dict] = field(default_factory=list)
-    current_positions: List[dict] = field(default_factory=list)
-    orders: List[RebalanceOrder] = field(default_factory=list)
-    summary: str = ""
 
 
 class ETFRebalancer:
@@ -232,105 +220,6 @@ class ETFRebalancer:
             return True, f"存在单类偏离 > {threshold*100:.0f}%"
 
         return False, f"偏离在阈值{threshold*100:.0f}%以内"
-
-    # ── 执行调仓 ──
-
-    def execute_orders(self, orders: List[RebalanceOrder]) -> List[dict]:
-        """通过 mx-moni 执行调仓指令"""
-        results = []
-        for order in orders:
-            result = self.mx_client.trade(
-                trade_type=order.action,
-                stock_code=order.code,
-                quantity=order.quantity,
-                use_market_price=True,
-            )
-            results.append({
-                "order": order,
-                "success": result is not None and (result.get("code") in ("0", "200")),
-                "response": result,
-            })
-        return results
-
-    # ── 生成报告 ──
-
-    def generate_report(self, target: Dict[str, float], positions: List[dict],
-                         total_assets: float, orders: List[RebalanceOrder],
-                         total_deviation: float,
-                         gate_state: str = "", hard_intercept: bool = False,
-                         pe_percentile: float = None, current_pe: float = None) -> str:
-        """生成 Markdown 格式的 ETF 配置报告（无偏移版，估值仅作参考展示）"""
-        from datetime import datetime
-
-        current = self._build_current_map(positions, total_assets)
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-        if pe_percentile is not None and current_pe is not None:
-            if pe_percentile < 20:
-                level = "极度低估"
-            elif pe_percentile < 40:
-                level = "低估"
-            elif pe_percentile < 60:
-                level = "合理"
-            elif pe_percentile < 80:
-                level = "高估"
-            else:
-                level = "极度高估"
-            gate_line = f"**PE 分位**: {pe_percentile:.0f}% ({level}) | **当前 PE**: {current_pe:.1f}"
-        else:
-            gate_line = f"**Gate**: {gate_state}" + (" + 硬拦截" if hard_intercept else "")
-
-        assets_line = f"**总资产**: {total_assets:,.0f} 元"
-
-        lines = [
-            f"# ETF 长期配置日报",
-            f"",
-            f"**时间**: {now} | {gate_line}",
-            assets_line,
-            f"",
-            "---",
-            "",
-            "## 目标 vs 实际",
-            "",
-            "| 资产 | 目标% | 实际% | 偏离 | 操作 |",
-            "|------|-------|-------|------|------|",
-        ]
-
-        order_map = {o.code: o for o in orders}
-        actual_sum = 0.0
-        rows: List[str] = []
-        for asset in self.baseline:
-            code = asset.code
-            tgt = target.get(code, 0.0) * 100
-            if code == "CASH":
-                cur = max(0, 100.0 - actual_sum)
-            else:
-                cur = current.get(code, {"current_pct": 0.0}).get("current_pct", 0.0) * 100
-                actual_sum += cur
-            dev = tgt - cur
-            order = order_map.get(code)
-            action = ""
-            if order:
-                action = f"{'🟢买' if order.action == 'buy' else '🔴卖'} {order.quantity}股"
-            rows.append(f"| {asset.name} | {tgt:.1f}% | {cur:.1f}% | {dev:+.1f}% | {action} |")
-        lines.extend(rows)
-
-        lines.extend(["", "---", ""])
-
-        if orders:
-            lines.append("## 建议调仓指令")
-            lines.append("")
-            for o in orders:
-                lines.append(f"- {o.action.upper()} {o.name}({o.code}) {o.quantity}股 ≈ {o.amount:,.0f}元 — {o.reason}")
-            lines.append("")
-
-        lines.extend([
-            "---",
-            "",
-            f"*总偏离度: {total_deviation*100:.1f}%*",
-        ])
-
-        return "\n".join(lines)
 
     # ── 工具函数 ──
 
