@@ -404,11 +404,15 @@ def _deploy_cash_section(alloc: dict) -> str:
     for a in CORE_BASELINE:
         if a.asset_type != AssetType.EQUITY:
             continue
+        manual_mark = " ⚠️ 需手动" if is_mx_untradable(a.code) else ""
         try:
             df = get_etf_daily(a.code)
         except Exception:
             df = None
         if df is None or len(df) < 25:
+            # 行情缺失也占一行（区分"没信号"和"没数据"），排在最后
+            rows.append((9, a.volatility_rank,
+                         f"| {a.name}({a.code}){manual_mark} | — | 行情数据缺失 | — |"))
             continue
         close = df["close"]
         ma20 = close.rolling(20).mean().iloc[-1]
@@ -425,14 +429,19 @@ def _deploy_cash_section(alloc: dict) -> str:
                  or (spread is not None and spread >= DIV_SPREAD_ACCEL))
 
         # 节奏判定：趋势（右侧纪律）x 估值（便宜加速）
+        # rank 显式排序（右侧纪律优先，估值只调位置）：0 顺趋势加速 → 1 顺趋势正常
+        # → 2 逆趋势极度低估（仅历史回退口径会触发）→ 3 逆趋势不急
         if above_ma20:
             rhythm = "🟢🟢 可加速（低估 + 企稳）" if cheap else "🟢 可正常补"
+            rank = 0 if cheap else 1
             basis = f"站上MA20，20日{ret20:+.1f}%"
         else:
             rhythm = "⏳ 不急：趋势向下，分批或等站回 MA20"
+            rank = 3
             basis = f"MA20下方，20日{ret20:+.1f}%"
         if pe_pct is not None and pe_pct < 20 and not above_ma20:
             rhythm = "🟡 极度低估：可分批加速，不必等企稳"
+            rank = 2
 
         if pe_pct is not None:
             pe_txt = f"{pe_pct:.0f}%"
@@ -442,14 +451,14 @@ def _deploy_cash_section(alloc: dict) -> str:
             pe_txt = f"PE{info['pe']:.1f}"
         else:
             pe_txt = "—"
-        manual_mark = " ⚠️ 需手动" if is_mx_untradable(a.code) else ""
-        rows.append((rhythm, f"| {a.name}({a.code}){manual_mark} | {pe_txt} | {basis} | {rhythm} |"))
+        rows.append((rank, a.volatility_rank,
+                     f"| {a.name}({a.code}){manual_mark} | {pe_txt} | {basis} | {rhythm} |"))
 
-    # 加速在前、不急在后
-    rows.sort(key=lambda x: ("🟢🟢" not in x[0], "⏳" in x[0], "🟡" in x[0]))
+    # 排序：节奏 rank → 波动率（同节奏内低波动先补，与旧钱买入侧同口径）
+    rows.sort(key=lambda x: (x[0], x[1]))
     lines.append("| 标的 | 估值(锚) | 趋势 | 补入节奏 |")
     lines.append("|---|---|---|---|")
-    lines.extend(r for _, r in rows)
+    lines.extend(r for _, _, r in rows)
     lines.append("")
     lines.append("> 估值口径：优先跟踪指数自身（中证官网当前 PE/股息率，不做历史分位——便宜判定收归全局节奏与红利利差）；"
                  "红利类看股息率−10Y国债利差（≥1.5pt 视同低估加速）；未映射标的回退申万行业 PE 分位；全市场仅作兜底；海外无估值数据。"
