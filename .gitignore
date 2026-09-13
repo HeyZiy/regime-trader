@@ -46,6 +46,7 @@ env/
 
 # 数据目录：仅版本化策略定义（注册表/待办库），运行状态与缓存不入库
 /data/AmazingData_local_data
+/data/research/
 logs/
 reports/
 *.db
