@@ -12,21 +12,24 @@
   - 从阶段高点回撤≥5%（阶段高点=近20日最高收盘，不含当日）
   - 板块明显走弱（所属行业板块当日跌幅≤-2%，数据缺失跳过）
 第二卖点（全仓清仓，满足其一）：
-  - 连续2日收盘跌破10日线
   - 放量跌破10日线（量比≥2 且 收盘<MA10）
   - 主线明显退潮（近似：板块当日跌幅≤-3%）
   - 个股跌破关键平台（近20日最低收盘，不含当日）
+  - 移动止盈触发：现价 ≤ max(持仓期最高收盘, 入场价) × 0.90（peak 只升不降）
+  - 持满 16 个交易日到期
+  以上与第一卖点**先到先出**。退出主干的设计依据：止损带在噪声区（入场距 MA10中位仅 3.6%，90% 天然触发且卖在局部低点），
+  移动止盈 10% 回测 +1.10%，显著优于MA10 止损口径的 +0.32%（research/trend_bt/README.md）。
 止盈保护（建议减半）：盈利≥15% 且 放量滞涨（量比≥2 且 涨幅<2% 或 收盘位于日内下半部）
 
-trending_down 收紧版：MA10 破位 1 天 / 回撤≥3% / 量比≥1.5 / 板块走弱阈值 -1%。
-硬拦截：全部清仓。
+trending_down 收紧版：回撤≥3% / 量比≥1.5 / 板块走弱阈值 -1%
+（退出主干——移动止盈 + 到期——各市场状态一致，不随收紧版变化）。
 sideways/chaos：用**正常版**并照常输出卖出信号——「自然退出」指不收紧阈值，
 不是不执行，正常版的清仓规则在 sideways/chaos 下照常生效。
 
 持仓事实来源：妙想模拟仓（用户手动同步持仓）。
 
 执行方式：由尾盘任务 trend_sell.py 在每交易日 14:45 后读取本模块信号，
-自动下模拟仓市价单（reduce_half / clear / 硬拦截全清 全部自动执行）。
+自动下模拟仓市价单（reduce_half / clear 全部自动执行）。
 本模块只负责判定，不碰下单；下单与股数收敛见 trend_sell.py:execute_sell()。
 
 量比口径：当日成交量 ÷ 前 5 日均量（不含当日）。
@@ -68,9 +71,11 @@ PEAK_WINDOW = 20              # 阶段高点/关键平台回看窗口（交易�
 TP_PROFIT_PCT = 15.0          # 止盈保护盈利线（%）
 TP_STALL_GAIN = 2.0           # 放量滞涨：当日涨幅 < 2%
 TP_CLOSE_POS = 0.4            # 放量滞涨：收盘位于日内区间下 40%
+TRAIL_TRIGGER_FACTOR = 0.90   # 移动止盈触发系数：触发价 = max(持仓期最高收盘, 入场价) × 0.90
+MAX_HOLD_TRADING_DAYS = 16    # 持有上限（交易日，不含入场日）：到期清仓
 
 # 减半后剩余仓位的操作提醒（用户主动执行，不做阶段跟踪）
-REDUCE_NOTE = "减仓后剩余仓位：止损线上移至10日线，收盘跌破即清仓"
+REDUCE_NOTE = "减仓后剩余仓位：由移动止盈（持仓期最高收盘×0.90）与 16 个交易日到期接管"
 
 
 @dataclass
@@ -129,8 +134,7 @@ class SellSignal:
 class HoldingRow:
     """持仓行 —— 日报「持仓卖出信号」板块的渲染输入（一只持仓一行）。
 
-    替代原 (position, signal, sector, sector_pct) 元组：元组按下标取值，
-    加字段时容易取错位置且无校验。
+    字段按名访问，避免元组按下标取值在加字段时错位且无校验。
 
     Attributes:
         position: 妙想持仓接口返回的标准化 dict
@@ -215,16 +219,20 @@ def _compute_metrics(df: pd.DataFrame) -> Optional[dict]:
 
 
 def _check_rules(metrics: dict, profit_pct: float, regime: str,
-                 sector_pct: Optional[float], hard_intercept: bool) -> Tuple[str, List[str], str]:
+                 sector_pct: Optional[float],
+                 exit_ctx: Optional[dict] = None) -> Tuple[str, List[str], str]:
     """逐条检查卖出规则。
+
+    Args:
+        exit_ctx: 持有端退出上下文（trend_sell 从退出状态文件构建）：
+            trail_trigger — 移动止盈触发价 = max(持仓期最高收盘, 入场价) × 0.90
+            held_days     — 已持有交易日数（不含入场日；取不到为 None）
+            peak          — 持仓期最高收盘（只升不降）
 
     Returns:
         (action, reasons, note)
         action: 'clear' | 'reduce_half' | ''（空=无信号）
     """
-    if hard_intercept:
-        return "clear", ["市场门控硬拦截，全部清仓"], ""
-
     # 只有 trending_down 收紧；sideways/weak_up/chaos 一律走正常版并照常输出信号
     tight = regime == "trending_down"
     vol_thr = VOL_RATIO_TIGHT if tight else VOL_RATIO_NORMAL
@@ -242,20 +250,20 @@ def _check_rules(metrics: dict, profit_pct: float, regime: str,
 
     # ── 第二卖点（全仓清仓）──
 
-    # 连续收盘跌破 MA10（收紧版缩为 1 天）
-    below_ma10_today = close < ma10
-    below_ma10_yesterday = (
-        metrics["prev_close"] < metrics["prev_ma10"] if metrics["prev_ma10"] > 0 else False
-    )
-    if tight and below_ma10_today:
-        clear_reasons.append(f"收盘跌破MA10{tag}（今{close:.2f}<MA10 {ma10:.2f}）")
-    elif not tight and below_ma10_today and below_ma10_yesterday:
-        clear_reasons.append(
-            f"连续2日收盘跌破MA10（昨{metrics['prev_close']:.2f}，今{close:.2f}<{ma10:.2f}）"
-        )
+    # 持有端退出主干（先到先出）
+    if exit_ctx:
+        trigger = exit_ctx.get("trail_trigger")
+        peak = exit_ctx.get("peak") or 0.0
+        if trigger and close <= trigger:
+            clear_reasons.append(
+                f"移动止盈触发（现价{close:.2f} ≤ 触发价{trigger:.2f}，peak {peak:.2f}×0.90）"
+            )
+        held = exit_ctx.get("held_days")
+        if held is not None and held >= MAX_HOLD_TRADING_DAYS:
+            clear_reasons.append(f"持满{MAX_HOLD_TRADING_DAYS}个交易日到期（已持{held}天）")
 
     # 放量跌破 MA10
-    if below_ma10_today and vol_ratio >= vol_thr:
+    if close < ma10 and vol_ratio >= vol_thr:
         clear_reasons.append(f"放量跌破MA10{tag}（量比{vol_ratio:.1f}≥{vol_thr}，收盘{close:.2f}<{ma10:.2f}）")
 
     # 主线明显退潮（近似：板块当日跌幅 ≤ -3%）
@@ -310,10 +318,11 @@ def _check_rules(metrics: dict, profit_pct: float, regime: str,
 
 
 def detect_sell_signals(code: str, name: str, df: pd.DataFrame, position: dict,
-                        regime: str, hard_intercept: bool,
+                        regime: str,
                         sector: str = UNKNOWN_SECTOR,
                         sector_pct: Optional[float] = None,
-                        entry_date: str = "") -> Optional[SellSignal]:
+                        entry_date: str = "",
+                        exit_ctx: Optional[dict] = None) -> Optional[SellSignal]:
     """检测单只持仓的卖出信号。
 
     Args:
@@ -321,10 +330,10 @@ def detect_sell_signals(code: str, name: str, df: pd.DataFrame, position: dict,
         df: 已排序并计算 MA5/MA10/MA20 的日线 DataFrame
         position: 妙想持仓接口返回的标准化 dict（含 count/cost_price/profit_pct）
         regime: 市场状态（trending_up/weak_up/sideways/trending_down/chaos）
-        hard_intercept: 市场门控硬拦截是否触发
         sector: 所属板块名称（取不到时为 UNKNOWN_SECTOR）
         sector_pct: 板块当日涨跌幅（None=无法判断，板块类规则跳过）
         entry_date: 买入日期（历史委托推导，可为空）
+        exit_ctx: 持有端退出上下文（移动止盈触发价/持有天数/peak），见 _check_rules
 
     Returns:
         SellSignal 或 None（无信号）。suggest_shares 已按可卖量收敛并取整到 100 整数倍，
@@ -335,7 +344,7 @@ def detect_sell_signals(code: str, name: str, df: pd.DataFrame, position: dict,
         return None
 
     profit_pct = position_profit_pct(position)
-    action, reasons, note = _check_rules(metrics, profit_pct, regime, sector_pct, hard_intercept)
+    action, reasons, note = _check_rules(metrics, profit_pct, regime, sector_pct, exit_ctx)
     if not action:
         return None
 

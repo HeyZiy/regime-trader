@@ -14,10 +14,10 @@ ETF 再平衡引擎
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from src.etf.config import (
-    AssetAllocation, AssetType, NEUTRAL_BASELINE, PROTECTED_TYPES,
+    NEUTRAL_BASELINE, PROTECTED_TYPES,
     get_rebalance_threshold, get_rotation_universe_codes,
     MIN_TRADE_DEVIATION, REBALANCE_TOTAL_THRESHOLD,
 )
@@ -138,11 +138,14 @@ class ETFRebalancer:
         return core_positions, rotation_mv, rotation_positions
 
     def compare(self, target: Dict[str, float], positions: List[dict],
-                total_assets: float, gate_state: str, hard_intercept: bool) -> Tuple[List[RebalanceOrder], float]:
+                total_assets: float, gate_state: str) -> Tuple[List[RebalanceOrder], float]:
         """比较目标 vs 实际，生成调仓指令（旧钱唯一动作：阈值再平衡）
 
         资金口径：核心资金 = 总资产（资金占比即总占比）。卫星仓与其他账户持仓
         不在基准代码集内，不产生偏离；其资金被"现金（以及其他账户）"桶吸收。
+
+        本方法只撒网：单笔按 MIN_TRADE_DEVIATION 过滤碎股偏差；分状态的
+        触发阈值在 should_rebalance 决定整批是否执行（见 config 阈值注释）。
 
         Returns:
             (orders, total_deviation) 调仓指令列表 + 总偏离度
@@ -151,7 +154,6 @@ class ETFRebalancer:
         current = self._build_current_map(positions, total_assets)
         # 补齐未持仓 ETF 的行情价格
         self._fill_missing_prices(current)
-        threshold = get_rebalance_threshold(gate_state)
         orders: List[RebalanceOrder] = []
         total_deviation = 0.0
 
@@ -183,7 +185,7 @@ class ETFRebalancer:
                     ))
             else:
                 # 需要减仓
-                if gate_state in ("trending_down", "chaos") or hard_intercept:
+                if gate_state in ("trending_down", "chaos"):
                     if asset.asset_type in PROTECTED_TYPES:
                         continue  # 黄金/债券不减
                 cur_count = cur.get("count", 0) or 0

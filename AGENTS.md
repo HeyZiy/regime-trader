@@ -12,8 +12,9 @@ src/trend/                       ← 趋势策略全链路：分析器(analyzer)
                                    日报生成(report，买入侧)
 trend_sell.py                    ← 尾盘卖出任务(14:45)：读妙想持仓→sell_rules 判定→
                                    自动下模拟仓市价单→自出成交报告并推送
-src/market_state/                ← 市场环境判断（跨策略共享）：趋势门控(market_gate，硬拦截 +
-                                   4项条件 + 5级状态)、风格状态判定(style_state，取数+指标+状态机+周报)，
+src/market_state/                ← 市场环境判断（跨策略共享）：趋势状态判定(market_gate，
+                                   指数均线纯结构 5 级；指数数据 AmazingData 单源——K线+快照补
+                                   当日bar+数据日期断言，无 akshare 回退)、风格状态判定(style_state)，
                                    文档见 strategy/style_state.md
 src/indicators.py                ← numba 指标算子封装（纯计算，无交易语义，根级别共享工具）
 src/etf/                         ← ETF 配置：再平衡+新钱投放(rebalancer)、
@@ -66,7 +67,7 @@ No test suite, no lint/typecheck commands.
 ## Key Conventions
 
 - Chinese docstrings and comments throughout
-- `data/` holds cached state (e.g. `market_gate_ice_days.json`, `style_state.json`)
+- `data/` holds cached state (e.g. `style_state.json`, `momentum_rank_history.json`)
 - Logging via `src/logging_config.py:setup_logging()` — console + file + debug file handlers
 - All stock codes normalized via `data_provider.base:canonical_stock_code()`
 - 目录归属规则：只服务一个策略 → 进该策略的包（`src/trend/`、`src/etf/`）；

@@ -13,10 +13,7 @@ import string
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.market_state.market_gate import RegimeDiagnosis
-from src.trend.entry_tier import (
-    MIN_STOP_LOSS_PCT, position_size, resolve_tier, tier_rule,
-)
+from src.market_state.market_gate import REGIME_CAN_OPEN, RegimeDiagnosis
 from src.trend.skip_rules import SKIP_RULES, SkipStats
 from src.trend.signal_detector import UNKNOWN_SECTOR, TechnicalSignal
 
@@ -66,15 +63,15 @@ _FORMATTER = string.Formatter()
 # ── 行模板：占位符名即业务语义，加列时表头与模板必须同时改，否则 _assert_aligned 抛错 ──
 _RANK_ROW = (
     "| {rank} | {stock} | {sector} | {price} | {pct} | {bias} | {vol} | {turnover} | "
-    "{score} | {effective} | {observation} | {levels} | {confirm} | {invalidate} | {sizing} |"
+    "{score} | {observation} | {levels} | {confirm} | {invalidate} | {sizing} |"
 )
 _RANK_HEADER = (
-    "#", "股票", "板块", "价格", "涨跌", "乖离MA5", "量比", "换手", "评分", "有效分",
+    "#", "股票", "板块", "价格", "涨跌", "乖离MA5", "量比", "换手", "评分",
     "操作要点", "关键价位", "确认条件", "失效条件", "仓位",
 )
 
 _PLAN_ROW = "| {rank} | {stock} | {sector} | {score} | {confirm} | {sizing} |"
-_PLAN_HEADER = ("排名", "股票", "板块", "评分→有效分", "介入条件", "仓位")
+_PLAN_HEADER = ("排名", "股票", "板块", "评分", "介入条件", "仓位")
 
 # 各信号类型分表的区头与说明（与 KNOWN_SIGNAL_TYPES 对应；新增类型必须在此登记，否则 KeyError）
 _SECTION_TITLES = {
@@ -99,8 +96,26 @@ _PAIR_HEADER = ("股票", "原因")
 _RULE_STAT_ROW = "| {rule} | {name} | {status} | {count} | {detail} |"
 _RULE_STAT_HEADER = ("规则", "内容", "状态", "检查/触发", "触发明细")
 
-# 达标线：有效评分 ≥ 此值才算"可执行"。低于此值只作观察，不进 T+1 计划。
+# 达标线：技术评分 ≥ 此值才算"可执行"。低于此值只作观察，不进 T+1 计划。
 QUALIFY_SCORE = 60
+
+# ── 统一仓位规则 ──
+# 唯一的环境级风控约束是单笔亏损限额；仓位上限 = 亏损限额 ÷ 止损距离。
+# 例：止损 5%，200 ÷ 5% = 4000 元。
+LOSS_BUDGET = 200.0
+MIN_STOP_LOSS_PCT = 3.0  # 止损距离下限：价格紧贴 MA10 时直接相除会算出天量仓位
+
+
+def position_size(stop_loss_pct: float) -> float:
+    """按亏损限额与止损距离算仓位上限（元）。
+
+    止损距离不足 MIN_STOP_LOSS_PCT 时按下限计。
+    """
+    try:
+        pct = max(float(stop_loss_pct), MIN_STOP_LOSS_PCT)
+    except (TypeError, ValueError):
+        pct = MIN_STOP_LOSS_PCT
+    return LOSS_BUDGET / pct * 100
 
 
 def _f(value: Any, nd: int = 2) -> str:
@@ -195,9 +210,14 @@ _DEFAULT_GUIDE: Dict[str, str] = {
 }
 
 
-def _build_action_guide(s: TechnicalSignal) -> dict:
+def _build_action_guide(s: TechnicalSignal, market_open: bool = True) -> dict:
     """
     为信号生成次日操作指引。
+
+    Args:
+        s: 技术信号
+        market_open: 当前市场环境是否允许开仓（can_trade）。False 时所有信号
+            仅作观察——能否开仓是市场层决策，不逐信号分化档位。
 
     Returns:
         dict 包含 observation（观察要点）、confirmation（确认条件）、
@@ -213,63 +233,65 @@ def _build_action_guide(s: TechnicalSignal) -> dict:
             guide['observation'] = "当日跌幅较大，观察次日能否止跌企稳（高开≥3%的反弹不追）；若继续阴线下跌则放弃"
             guide['confidence'] = "低"
         else:
-            guide['observation'] = "次日平开/高开<3%：早盘站稳MA5即有效，全天不破位则尾盘按确认条件介入；高开≥3%放弃（追高）；低开低走破MA5放弃"
+            guide['observation'] = "信号已确认（缩量回踩 + 不破5日线）。今日盘后 15:05-15:30 按收盘价固定价格申报买入，不等次日"
             guide['confidence'] = "中"
 
-        # 确认与下单的时序：收盘价 15:00 才定格而主板不能盘后交易，
-        # 因此介入动作固定在尾盘 14:45 后用当时价格近似判定，收盘价作事后复核。
-        guide['confirmation'] = f"次日尾盘14:45后：价≥MA5({_f(s.ma5)}) 且量比外推全天<1.2 → 市价介入，收盘价复核"
-        guide['invalidation'] = f"次日收盘价 < MA5({_f(s.ma5)}) * 0.99 或放量下跌(pct < -3%)"
+        # 介入时序：信号日盘后固定价格买入，15:05-15:30 按收盘价定价，不等次日确认
+        # （T+1 确认后买经回测证伪，配对差 -0.67pp）。
+        guide['confirmation'] = f"今日盘后 15:05-15:30：按收盘价 {_f(s.current_price)} 固定价格申报买入"
+        guide['invalidation'] = (
+            f"由卖出规则接管：现价 ≤ max(持仓期最高收盘, 入场价)×0.90 清仓"
+            f"（初始触发 ≈ {_f(s.current_price * 0.9)}），或持满 16 个交易日到期"
+        )
         guide['sizing'] = "正常仓位(50%)"
 
     elif s.signal_type == 'near_ma5':
         # 缩量贴MA5：同一 setup，但当日收涨且未触及MA5——是观察信号而非买点。
-        # 剧本从"次日接回踩"改为"等它回下来"，直接照回踩剧本操作会变成追高。
+        # 剧本从"次日接回踩"改为"等它回下来"：等未来某日出现缩量回踩信号，
+        # 触发日再按盘后固定价格纪律买入。
         guide['observation'] = (
-            "⚠️ 非回踩形态（当日收涨且未触及MA5），不是买点。次日不追高："
-            "等回踩MA5附近缩量企稳再接；若放量加速远离MA5则放弃观察"
+            "⚠️ 非回踩形态（当日收涨且未触及MA5），不是买点。不追高："
+            "等后续出现缩量回踩信号再按盘后纪律买入；若放量加速远离MA5则放弃观察"
         )
-        guide['confirmation'] = f"回踩MA5({_f(s.ma5)})附近缩量企稳，收盘价 >= MA5×0.995 且量比 < 1.2"
+        guide['confirmation'] = f"出现缩量回踩信号（收盘 ≥ MA5({_f(s.ma5)})×0.995 且量比 < 1.2）→ 触发日盘后按收盘价申报买入"
         guide['invalidation'] = f"放量加速远离MA5（乖离 > 5%）或收盘价 < MA5({_f(s.ma5)}) * 0.99"
         guide['sizing'] = "轻仓(25%)或等回踩"
 
     elif s.signal_type == 'pullback_ma10':
-        guide['observation'] = "观察次日弱转强：需收盘站上MA5(至少触碰)，若继续在MA5-MA10之间弱势震荡则等待"
+        guide['observation'] = "次日观察弱转强：需收盘站上MA5(至少触碰)，若继续在MA5-MA10之间弱势震荡则等待"
         guide['confidence'] = "低"
-        guide['confirmation'] = f"次日尾盘14:45后：收复MA5({_f(s.ma5)}) 且量比外推全天<1.0 → 市价介入，收盘价复核"
+        guide['confirmation'] = f"次日尾盘复核：收复MA5({_f(s.ma5)}) 且量比外推全天<1.0 → 确认日盘后 15:05-15:30 按收盘价申报买入"
         guide['invalidation'] = f"次日收盘跌破MA10({_f(s.ma10)}) 或继续缩量阴跌"
         guide['sizing'] = "半仓(25%)或观望"
 
-    # 根据有效评分调节（effective 未计算时会抛异常，不接受静默的 0 分）
-    if s.effective >= 80:
+    # 根据技术评分调节置信度与仓位基调
+    if s.score >= 80:
         guide['confidence'] = "高"
         if "轻仓" not in guide['sizing']:
             guide['sizing'] = "正常仓位(50%)"
-    elif s.effective >= 60:
+    elif s.score >= 60:
         guide['confidence'] = "中"
     else:
         guide['confidence'] = "低"
         guide['sizing'] = "观望或放弃"
 
-    # near_ma5 兜底封顶：评分类已封 79，防止它进"尾盘介入"档（与"等回踩"剧本矛盾）
+    # near_ma5 兜底封顶：评分类已封 79，防止它进"盘后介入"档（与"等回踩"剧本矛盾）
     if s.signal_type == 'near_ma5':
         if guide['confidence'] == "高":
             guide['confidence'] = "中"
         if "正常仓位" in guide['sizing']:
             guide['sizing'] = "轻仓(25%)或等回踩"
 
-    # 开仓档位 → 仓位上限。环境调整只落在仓位上，不乘评分系数：
-    # 系数会整体压低评分（弱的没筛掉、强的被拖进"暂不关注"），且无法归因。
-    rule = tier_rule(s.entry_tier)
-    if rule is None:
+    # 仓位上限 = 亏损限额 ÷ 止损距离（统一规则，不按环境分化档位）
+    if not market_open:
         guide['confidence'] = "低"
-        guide['sizing'] = "禁止开仓（当前状态不启用开仓档位）"
+        guide['sizing'] = "禁止开仓（当前市场状态不开新仓，信号仅作观察）"
     else:
         stop_pct = _stop_loss_pct(s)
-        cap = position_size(s.entry_tier, stop_pct)
+        cap = position_size(stop_pct)
         guide['sizing'] = (
-            f"{guide['sizing']}｜{rule.label}上限{cap:.0f}元"
-            f"（亏损限额{rule.loss_budget:.0f}元÷止损{stop_pct:.1f}%）"
+            f"{guide['sizing']}｜仓位上限{cap:.0f}元"
+            f"（亏损限额{LOSS_BUDGET:.0f}元÷止损{stop_pct:.1f}%）"
         )
 
     return guide
@@ -286,14 +308,15 @@ def _stop_loss_pct(s: TechnicalSignal) -> float:
     return MIN_STOP_LOSS_PCT
 
 
-def _format_rank_table(signals: List[TechnicalSignal], signal_type: str) -> List[str]:
+def _format_rank_table(signals: List[TechnicalSignal], signal_type: str,
+                       market_open: bool = True) -> List[str]:
     """生成带排名和操作指引的信号表格。"""
     lines = []
     if not signals:
         return lines
 
-    # 按有效评分降序排列
-    sorted_signals = sorted(signals, key=lambda s: s.effective, reverse=True)
+    # 按技术评分降序排列
+    sorted_signals = sorted(signals, key=lambda s: s.score, reverse=True)
 
     # 根据信号类型取区头与说明（表头与行模板两张表共用）
     title, note = _SECTION_TITLES[signal_type]
@@ -301,7 +324,7 @@ def _format_rank_table(signals: List[TechnicalSignal], signal_type: str) -> List
     lines.extend(_header(_RANK_HEADER, _RANK_ROW))
 
     for rank, s in enumerate(sorted_signals, 1):
-        guide = _build_action_guide(s)
+        guide = _build_action_guide(s, market_open)
         rank_str = f"🥇{rank}" if rank == 1 else f"🥈{rank}" if rank == 2 else f"🥉{rank}" if rank == 3 else f"#{rank}"
 
         lines.append(_row(
@@ -315,7 +338,6 @@ def _format_rank_table(signals: List[TechnicalSignal], signal_type: str) -> List
             vol=_f(s.volume_ratio),
             turnover=f"{_f(s.turnover_rate)}%",
             score=s.score,
-            effective=s.effective,
             observation=guide['observation'],
             levels=f"MA5={_f(s.ma5)} MA10={_f(s.ma10)}",
             confirm=guide['confirmation'],
@@ -327,99 +349,84 @@ def _format_rank_table(signals: List[TechnicalSignal], signal_type: str) -> List
     return lines
 
 
-def _format_t1_plan(signals: List[TechnicalSignal]) -> List[str]:
-    """生成 T+1 操作计划板块。"""
+def _format_after_close_plan(signals: List[TechnicalSignal], market_open: bool = True) -> List[str]:
+    """生成盘后操作计划板块（信号日盘后固定价格买入）。"""
     lines = [
-        "## 📋 T+1 操作计划",
+        "## 📋 盘后操作计划（15:05-15:30 固定价格买入）",
         "",
-        "> 盘后信号 → 次日观察（开盘方向 + 盘中不破位）→ 尾盘14:45后复核确认条件 → 满足即介入，收盘价事后复核。",
-        "> 开盘端限制（如高开≥3%放弃）以信号明细各行的「操作要点」为准。",
+        "> 信号日盘后 15:05-15:30 按收盘价固定价格申报买入，不等次日确认（T+1 确认买经回测证伪）。",
+        "> 信号 2（回踩MA10）需次日弱转强确认，确认日盘后执行；以各行「确认条件」为准。",
         "",
     ]
 
-    # 按有效评分分层（达标线用 QUALIFY_SCORE，与头条口径一致）
-    high_priority = [s for s in signals if s.effective >= 80]
-    medium_priority = [s for s in signals if QUALIFY_SCORE <= s.effective < 80]
-    low_priority = [s for s in signals if s.effective < QUALIFY_SCORE]
+    # 按技术评分分层（达标线用 QUALIFY_SCORE，与头条口径一致）
+    high_priority = [s for s in signals if s.score >= 80]
+    medium_priority = [s for s in signals if QUALIFY_SCORE <= s.score < 80]
+    low_priority = [s for s in signals if s.score < QUALIFY_SCORE]
 
     if not signals:
         lines.extend(["> 今日无信号，无可执行的次日计划。", ""])
         return lines
 
-    if high_priority:
+    if market_open and high_priority:
         lines.extend([
-            "### 🟢 优先关注（有效评分≥80）",
+            "### 🟢 优先关注（评分≥80）",
             "",
-            "适合尾盘介入。次日确认条件满足即可执行。",
+            "适合盘后直接申报买入（15:05-15:30 按收盘价定价）。",
             "",
         ])
         lines.extend(_header(_PLAN_HEADER, _PLAN_ROW))
-        for rank, s in enumerate(sorted(high_priority, key=lambda x: x.effective, reverse=True), 1):
-            guide = _build_action_guide(s)
+        for rank, s in enumerate(sorted(high_priority, key=lambda x: x.score, reverse=True), 1):
+            guide = _build_action_guide(s, market_open)
             lines.append(_row(
                 _PLAN_ROW,
                 rank=f"#{rank}",
                 stock=f"{s.name}({s.code})",
                 sector=s.sector,
-                score=f"{s.score}→{s.effective}",
+                score=s.score,
                 confirm=guide['confirmation'],
                 sizing=guide['sizing'],
             ))
         lines.append("")
 
-    if medium_priority:
+    if market_open and medium_priority:
         lines.extend([
-            "### 🟡 备选关注（有效评分60-79）",
+            "### 🟡 备选关注（评分60-79）",
             "",
-            "需更强确认信号。建议尾盘观察确认后再决定。",
+            "信号 2 需次日弱转强确认，确认日盘后执行。",
             "",
         ])
         lines.extend(_header(_PLAN_HEADER, _PLAN_ROW))
-        for rank, s in enumerate(sorted(medium_priority, key=lambda x: x.effective, reverse=True), 1):
-            guide = _build_action_guide(s)
+        for rank, s in enumerate(sorted(medium_priority, key=lambda x: x.score, reverse=True), 1):
+            guide = _build_action_guide(s, market_open)
             lines.append(_row(
                 _PLAN_ROW,
                 rank=f"#{rank}",
                 stock=f"{s.name}({s.code})",
                 sector=s.sector,
-                score=f"{s.score}→{s.effective}",
+                score=s.score,
                 confirm=guide['confirmation'],
                 sizing=guide['sizing'],
             ))
         lines.append("")
+
+    if not market_open:
+        lines.extend([
+            "> 🚫 当前市场状态不开新仓：以下信号仅作观察，不执行介入。",
+            "",
+        ])
 
     if low_priority:
         lines.extend([
-            f"### ⚪ 暂不关注（有效评分<{QUALIFY_SCORE}）",
+            f"### ⚪ 暂不关注（评分<{QUALIFY_SCORE}）",
             "",
-            "条件不成熟，或市场环境不利。等待后续信号改善。",
+            "条件不成熟。等待后续信号改善。",
             "",
         ])
-        for s in sorted(low_priority, key=lambda x: x.effective, reverse=True):
-            lines.append(f"- {s.name}({s.code}): 评分{s.score}→有效{s.effective}，{s.description}")
+        for s in sorted(low_priority, key=lambda x: x.score, reverse=True):
+            lines.append(f"- {s.name}({s.code}): 评分{s.score}，{s.description}")
         lines.append("")
 
-    return lines
-
-
-def _format_tier_block_section(blocked: List[Tuple[str, str, str]]) -> List[str]:
-    """生成开仓档位收紧拦截板块。
-
-    被档位拦下的信号必须显式列出——否则用户只看到"今日无信号"，
-    无法区分"没触发买点"与"触发了但被环境的收紧规则挡掉"。
-    """
-    lines = [
-        "## 🔒 档位收紧拦截",
-        "",
-        "> 已触发买点但不满足当前档位的收紧条件（位置 / 资金），不进信号池。",
-        "",
-    ]
-    lines.extend(_header(_PAIR_HEADER, _PAIR_ROW))
-    for code, name, reason in blocked[:20]:
-        lines.append(_row(_PAIR_ROW, stock=f"{name}({code})", reason=reason))
-    if len(blocked) > 20:
-        lines.append(_row(_PAIR_ROW, stock="...", reason=f"等共{len(blocked)}只股票"))
-    lines.extend(["", "---", ""])
     return lines
 
 
@@ -433,7 +440,7 @@ def _format_veto_section(vetoed_stocks: List[Tuple[str, str, str, str]]) -> List
         "## 🚫 负面清单否决（不进信号池、不看评分）",
         "",
         "> 任一规则触发即跳过当日信号（V1 公告 / V2 涨幅>100% / V3 高换手 / V4 连续大跌 / "
-        "V5 资金流出 / V6 涨跌停≥3天 / V7 距60日低点>80% / V8 压力位）。",
+        "V5 资金流出 / V6 涨跌停≥3天 / V7 距60日低点>80%）。",
         "",
     ]
 
@@ -513,6 +520,8 @@ def _format_regime_diagnosis(diag: Optional[RegimeDiagnosis]) -> List[str]:
         ])
     else:
         lines.append(f"> **收盘偏离 MA20**：—（{diag.note}）")
+    if diag.data_date:
+        lines.append(f"> **数据日期**：{diag.data_date}")
     lines.extend([
         f"> **命中路径**：{diag.path}",
         "",
@@ -523,9 +532,9 @@ def _format_regime_diagnosis(diag: Optional[RegimeDiagnosis]) -> List[str]:
 def _format_headline(signals: List[TechnicalSignal], removed_stocks, vetoed_stocks,
                      failed_stocks) -> List[str]:
     """报告头条：先说结论——有多少信号、多少达标、能不能动手。"""
-    qualified = sum(1 for s in signals if s.effective >= QUALIFY_SCORE)
+    qualified = sum(1 for s in signals if s.score >= QUALIFY_SCORE)
     lines = [
-        f"> 发现 **{len(signals)}** 个信号，其中 **{qualified}** 个达标（有效分≥{QUALIFY_SCORE}）",
+        f"> 发现 **{len(signals)}** 个信号，其中 **{qualified}** 个达标（评分≥{QUALIFY_SCORE}）",
         "",
     ]
     if not signals:
@@ -533,12 +542,12 @@ def _format_headline(signals: List[TechnicalSignal], removed_stocks, vetoed_stoc
     elif qualified == 0:
         # 有信号但一个都没达标：必须说清"不是没跑，是都不够格"
         lines.extend([
-            f"> 🚫 **今日无可执行信号**：{len(signals)} 个信号有效分均 <{QUALIFY_SCORE}，"
+            f"> 🚫 **今日无可执行信号**：{len(signals)} 个信号评分均 <{QUALIFY_SCORE}，"
             "按纪律不介入（详见下方信号明细）。",
             "",
         ])
     else:
-        lines.extend([f"> ✅ 可进入 T+1 观察名单：**{qualified}** 只。", ""])
+        lines.extend([f"> ✅ 可执行盘后买入（15:05-15:30）：**{qualified}** 只。", ""])
 
     lines.extend([
         f"> 跳过（趋势破坏）**{len(removed_stocks)}** 只 | 负面清单 **{len(vetoed_stocks)}** 只 | "
@@ -559,7 +568,6 @@ def generate_technical_report(
     detail_level: str = "standard",
     skip_stats: Optional[SkipStats] = None,
     regime_diag: Optional[RegimeDiagnosis] = None,
-    tier_blocked = None,
 ) -> str:
     """
     生成 Markdown 格式的趋势跟踪日报。
@@ -569,11 +577,11 @@ def generate_technical_report(
 
     报告结构（自上而下 = 决策优先级）：
         头条结论 → 市场环境（含状态判定明细）→ 跳过规则覆盖
-        → 趋势破坏跳过 → 负面清单 → 分析失败 → 信号明细 → T+1 操作计划
+        → 趋势破坏跳过 → 负面清单 → 分析失败 → 信号明细 → 盘后操作计划
 
 
     Args:
-        signals: TechnicalSignal 列表（须已 apply_regime，否则 effective 抛异常）
+        signals: TechnicalSignal 列表
         removed_stocks: (code, name, reason) 元组列表
         market_env: (can_trade, conditions, summary, regime) 或 None
         failed_stocks: (code, name, reason) 元组列表
@@ -581,7 +589,6 @@ def generate_technical_report(
         detail_level: "compact"（通知精简）| "standard"（文件标准）| "full"（完整含操作计划）
         skip_stats: 跳过规则逐条统计（SkipStats）
         regime_diag: 市场状态判定明细（RegimeDiagnosis）
-        tier_blocked: (code, name, reason) 元组列表，被开仓档位收紧规则拦下的候选
 
     Returns:
         格式化的 Markdown 字符串
@@ -589,7 +596,8 @@ def generate_technical_report(
     removed_stocks = removed_stocks or []
     failed_stocks = failed_stocks or []
     vetoed_stocks = vetoed_stocks or []
-    tier_blocked = tier_blocked or []
+    # 能否开仓是市场层决策（can_trade 已含状态与门控判定），统一作用于全部信号
+    market_open = bool(market_env and market_env[0])
     today_str = datetime.now().strftime('%Y-%m-%d')
 
     # ── 头条：先给结论（发现 N 个 / 达标 M 个 / 能不能动手）──
@@ -599,18 +607,15 @@ def generate_technical_report(
     # 大盘状态栏
     if market_env:
         can_trade = market_env[0]
-        conditions = market_env[1]
-        regime = market_env[3] if len(market_env) >= 4 else "chaos"
+        regime = market_env[2] if len(market_env) >= 3 else "chaos"
         regime_text = REGIME_DESC.get(regime, "❓ 状态不明")
         env_icon = "✅" if can_trade else "⛔"
-        met = sum(1 for v in conditions.values() if v)
-        total = len(conditions)
         lines.extend([
             "## 🌤️ 市场环境",
             "",
             f"> **【大盘状态】{regime_text}**",
             "",
-            f"> **{env_icon} {'允许开仓' if can_trade else '建议空仓'}**（满足{met}/{total}项条件）",
+            f"> **{env_icon} {'允许开仓' if can_trade else '建议空仓'}**（纯结构口径：均线状态决定能否开仓）",
             "",
         ])
         # 风格状态（元层观察，与大盘门控不同层：大盘管能不能开仓，风格管什么打法占优）
@@ -620,16 +625,11 @@ def generate_technical_report(
         # 判定明细：排列 + 偏离 MA20 + 命中路径，回答"为什么判成这个状态"
         lines.extend(_format_regime_diagnosis(regime_diag))
 
-        for cond_name, met_val in conditions.items():
-            icon = "✅" if met_val else ("❌" if met_val is not None else "⟖")
-            lines.append(f"- {icon} {cond_name}")
-
-        # 当前环境启用的开仓档位（环境调整落到具体规则，不再乘评分系数）
-        rule = tier_rule(resolve_tier(regime))
-        if rule is None:
+        # 当前环境是否允许开仓（能否开仓 = 市场层统一决策，作用于全部信号）
+        if regime not in REGIME_CAN_OPEN:
             lines.extend([
                 "",
-                f"> 📌 当前状态**不启用开仓档位**：禁止开新仓（有效评分 = 技术评分，信号仅作观察）。",
+                "> 📌 当前状态**不开新仓**：信号仅作观察（持仓卖出照常）。",
                 "",
                 "---",
                 "",
@@ -637,17 +637,11 @@ def generate_technical_report(
         else:
             lines.extend([
                 "",
-                f"> 📌 当前启用 **{rule.label}** 开仓规则：{rule.describe()}。",
-                "",
-                "> 仓位上限 = 亏损限额 ÷ 止损距离（止损参考 MA10）。环境只收紧规则与仓位，不乘评分系数。",
+                "> 📌 仓位上限 = 亏损限额 ÷ 止损距离（止损参考 MA10），不乘评分系数。",
                 "",
                 "---",
                 "",
             ])
-
-        # 档位收紧拦截（有则展示，说明"信号没进池"是规则生效而非没跑）
-        if tier_blocked:
-            lines.extend(_format_tier_block_section(tier_blocked))
 
     # 跳过规则覆盖情况：逐条「检查 N 只 / 触发 N 只」，未实现项显式标注
     lines.extend(_format_skip_stats_section(skip_stats))
@@ -687,15 +681,15 @@ def generate_technical_report(
     pullback_ma5_signals = [s for s in signals if s.signal_type == 'pullback_ma5']
     pullback_ma10_signals = [s for s in signals if s.signal_type == 'pullback_ma10']
     near_ma5_signals = [s for s in signals if s.signal_type == 'near_ma5']
-    lines.extend(_format_rank_table(pullback_ma5_signals, 'pullback_ma5'))
-    lines.extend(_format_rank_table(pullback_ma10_signals, 'pullback_ma10'))
-    lines.extend(_format_rank_table(near_ma5_signals, 'near_ma5'))
+    lines.extend(_format_rank_table(pullback_ma5_signals, 'pullback_ma5', market_open))
+    lines.extend(_format_rank_table(pullback_ma10_signals, 'pullback_ma10', market_open))
+    lines.extend(_format_rank_table(near_ma5_signals, 'near_ma5', market_open))
     if not signals:
         lines.extend(["> 今日无信号。", ""])
     lines.extend(["---", ""])
 
-    # ── T+1 操作计划：只把达标的分层列出（与信号明细互补，不重复罗列全部信号）──
+    # ── 盘后操作计划：只把达标的分层列出（与信号明细互补，不重复罗列全部信号）──
     if detail_level in ("full", "standard"):
-        lines.extend(_format_t1_plan(signals))
+        lines.extend(_format_after_close_plan(signals, market_open))
 
     return "\n".join(lines)

@@ -15,7 +15,7 @@ ETF 长期配置 — 中性基准
 """
 
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, List, Optional
+from typing import Dict, FrozenSet, List
 
 # ── 类别枚举 ──
 
@@ -81,15 +81,19 @@ TRACKED_INDEX: Dict[str, str] = {
 DIVIDEND_STYLE_CODES: FrozenSet[str] = frozenset({"515180"})
 
 # 减仓优先级：按 volatility_rank 从高到低（创业板先减，国债/现金后减）
-# gold 和 bond 在 trending_down/chaos/hard_intercept 时不减
+# gold 和 bond 在 trending_down/chaos 时不减
 PROTECTED_TYPES = {AssetType.GOLD, AssetType.BOND}
 
-# 再平衡阈值
-REBALANCE_SINGLE_THRESHOLD = 0.05     # 单类偏离 > 5% 触发
-REBALANCE_TOTAL_THRESHOLD = 0.15      # 所有偏离绝对值之和 > 15% 强制触发
+# 再平衡阈值——触发与执行分层的两段式设计：
+# 触发层（should_rebalance）：单类偏离 > 分状态阈值（get_rebalance_threshold）
+#   或总偏离 > 15%，决定整批是否执行；
+# 执行层（compare）：整批一起修，单笔只按 MIN_TRADE_DEVIATION 过滤碎股。
+# 分状态阈值不作用于单笔订单：上行期 3~5% 的漂移保留（让盈利奔跑），扳机扣下才随批修齐。
+REBALANCE_SINGLE_THRESHOLD = 0.05     # sideways 等其余状态的触发阈值
+REBALANCE_TOTAL_THRESHOLD = 0.15      # 所有偏离绝对值之和 > 15% 强制触发（无视状态）
 REBALANCE_LOOSE_THRESHOLD = 0.08      # trending_up/weak_up 时的放宽阈值
-REBALANCE_TIGHT_THRESHOLD = 0.03      # trending_down/chaos/hard_intercept 时的收紧阈值
-MIN_TRADE_DEVIATION = 0.02            # 忽略 < 2% 的碎股偏差
+REBALANCE_TIGHT_THRESHOLD = 0.03      # trending_down/chaos 时的收紧阈值
+MIN_TRADE_DEVIATION = 0.02            # 碎股偏差过滤：执行批内 < 2% 的不修
 
 
 def get_neutral_baseline() -> List[AssetAllocation]:

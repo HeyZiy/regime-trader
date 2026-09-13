@@ -4,7 +4,7 @@
 行业动量轮动 — 卫星仓引擎
 ===================================
 
-主账户卫星仓的战术策略（原"ETF 火箭"重构而来）：动量策略族的行业粒度子策略，
+主账户卫星仓的战术策略：动量策略族的行业粒度子策略，
 赚行业相对市场超额延续的钱。三层结构：
 
   1. 选行业（周频截面排名，momentum_score）—— 价能 60（相对沪深300 的 20/60 日
@@ -17,7 +17,7 @@
 
 与个股趋势子策略（trend_strategy）的关系见 strategy/overview.md：
 同一动量策略族的两个粒度，门控走降杠杆版——
-硬拦截只禁新开仓、不强制清仓（截面轮动的立身之本是弱市里也有相对强行业）。
+禁新开仓、不强制清仓（截面轮动的立身之本是弱市里也有相对强行业）。
 
 口径说明：
 - 量能/拥挤度均为行业口径真数据（AmazingData 行业 AMOUNT/CLOSE/PE）：
@@ -443,10 +443,10 @@ def _pe_pct_for(res: dict) -> Optional[float]:
 
 
 def build_sell_orders(results: List[dict], positions: List[dict], entry_map: Dict[str, str],
-                      hard_intercept: bool, force_flat: bool = False) -> Tuple[List[dict], List[str]]:
+                      force_flat: bool = False) -> Tuple[List[dict], List[str]]:
     """生成卫星卖出订单（动量退出规则，持仓起点全部来自模拟仓数据）。
 
-    降杠杆门控：硬拦截只禁新开仓，不强制清仓（截面轮动弱市里也有相对强行业，
+    降杠杆门控：市场状态恶化只禁新开仓，不强制清仓（截面轮动弱市里也有相对强行业，
     与个股趋势子策略的全量门控差异，见 overview.md）。
     风格状态门控：force_flat（真空/退潮期）为最高优先，直接清仓全部卫星持仓，
     覆盖所有常规退出规则——归因显示 off 期亏损来自存量持仓流血，等常规规则
@@ -531,15 +531,15 @@ def build_sell_orders(results: List[dict], positions: List[dict], entry_map: Dic
 
 
 def build_buy_orders(results: List[dict], held_codes: set, total_assets: float,
-                     satellite_mv: float, hard_intercept: bool,
+                     satellite_mv: float,
                      regime: str, block_new: bool = False) -> Tuple[List[dict], List[str]]:
     """生成卫星买入订单（关注池 ∩ 放量突破 ∩ 环境许可，拥挤度 ≥80% 分位减半仓）。
 
-    环境许可 = 非硬拦截 + regime 为 trending_up / weak_up（硬拦截为禁买，
-    不清仓）；风格状态门控 block_new（真空/退潮期）同样禁新开。
+    环境许可 = regime 为 trending_up / weak_up（其余状态禁买、不清仓）；
+    风格状态门控 block_new（真空/退潮期）同样禁新开。
     估值过滤用候选 ETF 自身行业 PE 分位 < 90%，不用全市场 PE。
     """
-    if hard_intercept or block_new:
+    if block_new:
         return [], []
     if regime not in ("trending_up", "weak_up"):
         return [], []
@@ -596,7 +596,7 @@ def build_buy_orders(results: List[dict], held_codes: set, total_assets: float,
 # ── 汇总 ──
 
 def analyze_satellite(positions: List[dict], total_assets: float,
-                      hard_intercept: bool, regime: str,
+                      regime: str,
                       client=None, state_gate: Optional[dict] = None) -> dict:
     """卫星仓全流程：排名 → 卖出 → 买入。不执行交易，只出指令。
 
@@ -607,9 +607,8 @@ def analyze_satellite(positions: List[dict], total_assets: float,
     核心仓标的（如 516560 养老ETF）不纳入卫星买卖与市值统计。
 
     PE 口径：逐只行业 PE（≥90% 锁仓/禁买），全市场 PE 不参与卫星决策。
-    locked 仅反映硬拦截（禁买不强制清仓，降杠杆门控）；state_gate 为风格
-    状态门控（style_state.satellite_state_gate 输出）：真空/退潮期 force_flat
-    强制清仓 + block_new 禁新开，优先级高于硬拦截；None 时门控不启用。
+    state_gate 为风格状态门控（style_state.satellite_state_gate 输出）：
+    真空/退潮期 force_flat 强制清仓 + block_new 禁新开；None 时门控不启用。
     """
     results = analyze_universe(update_rank_history=True)
     for r in results:
@@ -624,7 +623,7 @@ def analyze_satellite(positions: List[dict], total_assets: float,
     force_flat = bool(gate.get("force_flat"))
     block_new = bool(gate.get("block_new"))
 
-    sells, sell_notes = build_sell_orders(results, positions, {}, hard_intercept,
+    sells, sell_notes = build_sell_orders(results, positions, {},
                                           force_flat=force_flat)
 
     universe_codes = {r["code"] for r in results}
@@ -634,7 +633,7 @@ def analyze_satellite(positions: List[dict], total_assets: float,
                   if p.get("code", "") in universe_codes and int(p.get("count", 0) or 0) > 0}
 
     buys, buy_notes = build_buy_orders(results, held_codes, total_assets, satellite_mv,
-                                       hard_intercept, regime, block_new=block_new)
+                                       regime, block_new=block_new)
 
     # 动量排名（选行业层结果，周报观察章节与调仓共用）
     ranked = sorted([r for r in results if r["momentum_score"] > 0],
@@ -649,6 +648,5 @@ def analyze_satellite(positions: List[dict], total_assets: float,
         "ranked": ranked,
         "satellite_mv": satellite_mv,
         "held_codes": held_codes,
-        "locked": hard_intercept,
         "state_gate": state_gate,
     }

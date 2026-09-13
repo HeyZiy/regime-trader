@@ -12,7 +12,7 @@
   关注"再便宜也不能买"。
 - signal_detector：买点形态与信号质量门（is_euphoric / is_overextended）。
 
-规则清单（9 条，任一触发即否决）：
+规则清单（8 条，任一触发即否决）：
     V1 [外部] 近 20 日发布过股票交易异常波动 / 风险提示公告        → skip
     V2 [行情] 近 60 日累计涨幅 > 100%                              → skip
     V3 [行情] 近 20 日换手率均值 > 12%                             → skip
@@ -20,7 +20,6 @@
     V5 [外部] 近 5 日主力资金净流出 > 流通市值 1%                   → skip
     V6 [行情] 近 20 日涨停或跌停天数 ≥ 3                           → skip
     V7 [行情] 距近 60 日最低收盘价的涨幅 > 80%                      → skip
-    V8 [行情] 反弹逼近前高（曾深跌≥15% 且当前距 60 日前高 < 10%）   → skip
     V9 [行情] 近 20 日日收益率标准差 > 5%（波动率过大）             → skip
 
 动作语义：
@@ -28,7 +27,7 @@
   被否决的票当日不出信号，次日名单随新一轮选股重新判定。
 
 设计约定：
-- 行情类规则（V2/V3/V4/V6/V7/V8/V9）纯本地计算，无额外 I/O，可对选股名单逐股执行。
+- 行情类规则（V2/V3/V4/V6/V7/V9）纯本地计算，无额外 I/O，可对选股名单逐股执行。
 - 外部数据规则（V1/V5）依赖妙想 API 且有日调用限额，只对"已产出信号"的候选
   惰性执行；数据缺失或解析失败一律 fail-open（记 warning 放行），避免外部
   数据源抖动导致整个系统静默黑屏。
@@ -68,9 +67,6 @@ FUND_FLOW_SANITY_PCT = 50.0       # V5 单位合理性上限：净流出超流�
 LIMIT_MOVE_DAYS = 3               # V6 涨跌停天数阈值
 LIMIT_MOVE_LOOKBACK = 20          # V6 回溯天数
 FROM_60D_LOW_MAX = 80.0           # V7 距60日最低收盘涨幅上限(%)
-NEAR_HIGH_PCT = 10.0              # V8 距60日前高的距离阈值(%)
-PULLBACK_DEPTH_RATIO = 0.85       # V8 判定"曾深跌"的回撤比例（最低收盘 ≤ 最高收盘×0.85）
-HIGH_NOT_RECENT_BARS = 3          # V8 前高须形成于≥3个交易日前（排除正在创新高的主升股）
 VOLATILITY_20D_MAX = 5.0          # V9 近20日日收益率标准差上限(%)，博弈激烈、波动过大
 
 # 计算 60 日规则所需的最少交易日数（今日 + 60 个交易日前的基准）
@@ -97,7 +93,7 @@ class VetoResult:
         self.reasons.append(reason)
 
 
-# ==================== 行情类规则（V2/V3/V4/V6/V7/V8/V9）====================
+# ==================== 行情类规则（V2/V3/V4/V6/V7/V9）====================
 
 def _limit_move_threshold(code: str) -> float:
     """涨跌停判定阈值(%)。
@@ -112,7 +108,7 @@ def _limit_move_threshold(code: str) -> float:
 
 
 def check_market_veto(code: str, name: str, df: Optional[pd.DataFrame]) -> VetoResult:
-    """负面清单 — 行情类规则（V2/V3/V4/V6/V7/V8/V9），纯本地计算，无外部 I/O。
+    """负面清单 — 行情类规则（V2/V3/V4/V6/V7/V9），纯本地计算，无外部 I/O。
 
     Args:
         code: 股票代码
@@ -171,13 +167,12 @@ def check_market_veto(code: str, name: str, df: Optional[pd.DataFrame]) -> VetoR
     # --- 60 日规则：需要至少 61 个交易日 ---
     if n < BARS_FOR_60D:
         logger.warning(
-            f"  {tag}: 数据仅{n}条(<{BARS_FOR_60D})，60日类否决规则(V2/V7/V8)跳过"
+            f"  {tag}: 数据仅{n}条(<{BARS_FOR_60D})，60日类否决规则(V2/V7)跳过"
         )
         return result
 
     window = closes.iloc[-60:]
     last_close = float(closes.iloc[-1])
-    high_60 = float(window.max())
     low_60 = float(window.min())
 
     # --- V2 近60日累计涨幅 > 100% ---
@@ -197,23 +192,6 @@ def check_market_veto(code: str, name: str, df: Optional[pd.DataFrame]) -> VetoR
                 f"V7 距60日最低收盘涨幅{from_low:.1f}%>{FROM_60D_LOW_MAX}%",
             )
 
-    # --- V8 反弹逼近前高压力位 ---
-    # 三个条件同时满足才算"反弹回前高"（持续创新高的主升股不受影响）：
-    #   1) 60 日最高收盘形成于 ≥3 个交易日前（当前并未创新高）
-    #   2) 当前收盘距该前高 < 10%
-    #   3) 期间曾深跌：60 日最低收盘 ≤ 最高收盘 × 0.85
-    if high_60 > 0:
-        bars_from_high = int(len(window) - 1 - int(window.values.argmax()))
-        dist_to_high = (high_60 - last_close) / high_60 * 100
-        if (
-            bars_from_high >= HIGH_NOT_RECENT_BARS
-            and 0 <= dist_to_high < NEAR_HIGH_PCT
-            and low_60 <= high_60 * PULLBACK_DEPTH_RATIO
-        ):
-            result.add(
-                f"V8 反弹逼近{bars_from_high}日前高点(距{dist_to_high:.1f}%<{NEAR_HIGH_PCT}%)，"
-                f"期间最大回撤{(1 - low_60 / high_60) * 100:.1f}%",
-            )
 
     if result.vetoed:
         logger.info(f"🚫 负面清单否决 {tag}: {'；'.join(result.reasons)} → {ACTION_LABELS[result.action]}")
@@ -359,10 +337,7 @@ def _check_announcement_veto(code: str, name: str, mx_service: Any) -> Optional[
 
 def fetch_main_net_inflow(code: str, name: str, mx_service: Any,
                           days: int = FUND_FLOW_DAYS) -> Optional[float]:
-    """近 N 日主力资金净流入合计（元）。
-
-    供 V5（净流出否决）与开仓档位「收紧档资金确认」共用——两者口径必须一致，
-    否则会出现"V5 判为流出、档位判为流入"的自相矛盾。
+    """近 N 日主力资金净流入合计（元）。供 V5（净流出否决）使用。
 
     Returns:
         净流入合计（元，负数=净流出）；取不到或解析失败返回 None（fail-open）
@@ -423,7 +398,7 @@ def _check_fund_flow_veto(code: str, name: str, mx_service: Any, fetcher: Any) -
 
     if ratio > FUND_FLOW_OUTFLOW_PCT:
         return (
-            f"V5 近{len(recent)}日主力净流出{outflow / 1e8:.2f}亿，"
+            f"V5 近{FUND_FLOW_DAYS}日主力净流出{outflow / 1e8:.2f}亿，"
             f"占流通市值{ratio:.2f}%>{FUND_FLOW_OUTFLOW_PCT}%"
         )
     return None

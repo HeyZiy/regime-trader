@@ -203,18 +203,18 @@ def _compute_allocation():
     target = rebalancer.calculate_target()
 
     # 市场门控：regime 只选再平衡阈值松紧 + 卫星仓许可（不再驱动核心仓位）
-    regime, hard_intercept = "chaos", False
+    regime = "chaos"
     try:
-        from src.market_state.market_gate import check_market_gate, fetch_gate_inputs
+        from src.market_state.market_gate import check_market_gate, fetch_index_df
 
-        _can, _cond, _sum, regime, hard_intercept = check_market_gate(fetch_gate_inputs(fm))
+        _can, _sum, regime = check_market_gate(fetch_index_df())
     except Exception:
         logger.warning("市场门控获取失败，卫星仓禁买", exc_info=True)
 
     core_positions, rotation_mv, rotation_positions = rebalancer.split_rotation_positions(positions)
     orders, total_deviation = rebalancer.compare(
         target, positions, total_assets,
-        gate_state=regime, hard_intercept=hard_intercept,
+        gate_state=regime,
     )
     _should, reason = rebalancer.should_rebalance(orders, total_deviation, gate_state=regime)
 
@@ -231,7 +231,7 @@ def _compute_allocation():
         from src.etf import industry_momentum as sat_mod
 
         satellite = sat_mod.analyze_satellite(positions, total_assets,
-                                              hard_intercept, regime, client=client,
+                                              regime, client=client,
                                               state_gate=state_gate)
     except Exception:
         logger.warning("卫星仓分析失败", exc_info=True)
@@ -253,7 +253,6 @@ def _compute_allocation():
         "reason": reason,
         "satellite": satellite,
         "regime": regime,
-        "hard_intercept": hard_intercept,
     }
 
 
@@ -487,8 +486,6 @@ def _satellite_overview(satellite: dict) -> str:
 
     lines = ["## 五、卫星仓 — 行业动量轮动", ""]
     lines.append(f"预算 10% | 最多 2 只 | 当前卫星持仓市值 {satellite['satellite_mv']:,.0f} 元")
-    if satellite["locked"]:
-        lines.append("🔒 市场门控硬拦截：卫星仓禁新开仓（已持仓不动，降杠杆门控）")
     # 风格状态门控（真空/退潮期清仓+禁新开；状态数据缺失/过期时 fail-open 放行）
     gate = satellite.get("state_gate")
     if gate and gate.get("state"):

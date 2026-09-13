@@ -21,6 +21,7 @@ import io
 import logging
 import os
 import threading
+from datetime import date as date_cls, timedelta
 from typing import ClassVar, Optional, Dict, Any
 
 import numpy as np
@@ -50,6 +51,30 @@ _TGW_PASSWORD = os.getenv("TGW_PASSWORD", "").strip()
 def tgw_configured() -> bool:
     """是否已配置 TGW 登录凭证。"""
     return bool(_TGW_HOST and _TGW_PORT and _TGW_USERNAME and _TGW_PASSWORD)
+
+
+def _index_code_to_tgw_format(code: str) -> Optional[str]:
+    """
+    指数代码转换为 tgw 格式（sh000001 / 000001 -> 000001.SH）。
+
+    指数与个股走独立通道：000001 在个股通道是平安银行(000001.SZ)，
+    在指数通道是上证指数(000001.SH)——两者 tgw 代码本就不同市场后缀，
+    但转换入口必须分开，避免裸码歧义导致误查个股 K 线。
+
+    Returns:
+        tgw 格式代码；不支持的代码返回 None
+    """
+    code = (code or "").strip().lower()
+    if code.startswith(("sh", "sz", "bj")) and len(code) == 8:
+        pref, num = code[:2], code[2:]
+    else:
+        # 裸码按确定规则推断：399 → 深证/国证指数，其余 → 上证指数
+        pref, num = ("sz" if code.startswith("399") else "sh"), code
+    if not (num.isdigit() and len(num) == 6):
+        return None
+    if pref == "bj":
+        return None  # 北交所指数暂不支持
+    return f"{num}.{pref.upper()}"
 
 
 def _code_to_tgw_format(code: str) -> str:
@@ -344,6 +369,99 @@ class AmazingDataFetcher(BaseFetcher):
     def get_market_stats(self) -> Optional[Dict[str, Any]]:
         """AmazingData 未提供市场统计接口，返回 None。"""
         return None
+
+    # ---------- 指数数据（市场状态判定专用，单源无回退） ----------
+
+    def get_index_daily(self, code: str = "sh000001", days: int = 120) -> Optional[pd.DataFrame]:
+        """
+        指数日线（query_kline，市场状态判定唯一数据源，无回退源）。
+
+        指数码族与个股独立转换（见 _index_code_to_tgw_format）。
+        当日 bar 收盘后何时入库手册未写，由 market_gate 层用指数快照
+        补当日 bar + 数据日期断言兜底。
+
+        Returns:
+            DataFrame(date/open/high/low/close/volume/amount，按日期升序)；取不到返回 None
+        """
+        tgw_code = _index_code_to_tgw_format(code)
+        if tgw_code is None:
+            logger.warning(f"[AmazingData] 不支持的指数代码 {code}")
+            return None
+
+        self._ensure_login()
+        end = int(date_cls.today().strftime("%Y%m%d"))
+        begin = int((date_cls.today() - timedelta(days=days * 2)).strftime("%Y%m%d"))
+
+        try:
+            from AmazingData.utils.constant import Period
+
+            logger.info(f"[API调用] query_kline({tgw_code}, {begin}~{end}, period=day, 指数)")
+            kline_dict = self._market_data.query_kline(
+                [tgw_code],
+                begin_date=begin,
+                end_date=end,
+                period=Period.day.value,
+            )
+        except SystemExit:
+            raise DataFetchError("AmazingData 查询被中断")
+        except Exception as e:
+            raise DataFetchError(f"AmazingData 指数 query_kline 失败: {e}") from e
+
+        df = kline_dict.get(tgw_code) if isinstance(kline_dict, dict) else None
+        if df is None or df.empty:
+            logger.warning(f"[AmazingData] 指数 {tgw_code} 未返回 K 线数据")
+            return None
+
+        df = df.rename(columns={"kline_time": "date"})
+        df["date"] = pd.to_datetime(df["date"])
+        keep = ["date", "open", "high", "low", "close", "volume", "amount"]
+        df = df[[c for c in keep if c in df.columns]].sort_values("date").reset_index(drop=True)
+        logger.info(f"[API返回] 指数 {tgw_code} 日线 {len(df)} 根，最新 {df['date'].iloc[-1]}")
+        return df
+
+    def get_index_snapshot(self, code: str = "sh000001",
+                           day: Optional[date_cls] = None) -> Optional[Dict[str, Any]]:
+        """
+        指数单点快照（query_snapshot，取 day 当日最后一笔）。
+
+        SnapshotIndex 字段（附录 4.2.4）：last=最新价、close=收盘价（仅上海有效，
+        盘中即随最新价跳动）、volume=成交总量（上交所:手）、amount=成交总金额。
+        用于补齐日 K 的当日 bar（收盘后 close/volume 即官方值；盘中为最新近似，
+        与尾盘 14:45 近似收盘的既有口径一致）。
+
+        Returns:
+            {open, high, low, close, last, volume, amount, trade_time}；取不到返回 None
+        """
+        tgw_code = _index_code_to_tgw_format(code)
+        if tgw_code is None:
+            logger.warning(f"[AmazingData] 不支持的指数代码 {code}")
+            return None
+
+        self._ensure_login()
+        day = day or date_cls.today()
+        day_int = int(day.strftime("%Y%m%d"))
+
+        try:
+            snapshot_dict = self._market_data.query_snapshot(
+                [tgw_code], begin_date=day_int, end_date=day_int,
+            )
+        except SystemExit:
+            raise DataFetchError("AmazingData 查询被中断")
+        except Exception as e:
+            raise DataFetchError(f"AmazingData 指数 query_snapshot 失败: {e}") from e
+
+        df = snapshot_dict.get(tgw_code) if isinstance(snapshot_dict, dict) else None
+        if df is None or df.empty:
+            logger.warning(f"[AmazingData] 指数 {tgw_code} {day} 无快照数据")
+            return None
+
+        row = df.iloc[-1]  # 当日最后一笔快照 = 收盘定格状态（盘中为最新状态）
+        snap = {k: row[k] for k in ("open", "high", "low", "close", "last", "volume", "amount")
+                if k in df.columns}
+        snap["trade_time"] = row.get("trade_time", row.name)
+        logger.info(f"[API返回] 指数 {tgw_code} {day} 快照: close={snap.get('close')}, "
+                    f"last={snap.get('last')}, volume={snap.get('volume')}")
+        return snap
 
 
 if __name__ == "__main__":

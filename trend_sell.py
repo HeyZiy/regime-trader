@@ -8,12 +8,13 @@
 
 1. 读取妙想模拟仓股票持仓（持仓事实来源）
 2. 复用 src/trend/sell_rules.py 的完全分类规则检测卖出信号
-   （第一卖点减仓50% / 第二卖点清仓 / 止盈保护减半 / 门控硬拦截全清）
+   （第一卖点减仓50% / 第二卖点清仓 / 移动止盈 peak×0.90 + 16 个交易日到期 / 止盈保护减半）
 3. 命中即自动下模拟仓市价单（委托数量为 100 整数倍，按可用股数收敛）
 4. 自行渲染成交报告并推送
 
 执行约定：
-- reduce_half（减仓50%）/ clear（清仓）/ 硬拦截全清 均自动下市价单，无需人工确认。
+- reduce_half（减仓50%）/ clear（清仓）均自动下市价单，无需人工确认。
+- 移动止盈峰值每日更新并落盘 data/position_exit_state.json（只升不降；加仓入场日推进时重置）。
 - 逐只隔离：单只取数或下单失败不影响其余持仓，最终汇总四类结果
   （success / failed / manual_skip / insufficient）。
 - 不可交易标的（1 开头深市 ETF/LOF，见 src/mx/client.py）记为 manual_skip 单列提示。
@@ -22,29 +23,38 @@
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime
-from typing import List, Optional, Tuple
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
 
 from data_provider import canonical_stock_code
 from src.config import setup_env
 from src.logging_config import setup_logging
-from src.market_state.market_gate import check_market_gate, fetch_gate_inputs
+from src.market_state.market_gate import check_market_gate, fetch_index_df
 from src.mx.client import MXMoniClient, is_mx_untradable
 from src.mx.position_utils import (
     filter_stock_positions, get_last_buy_dates_safe, position_profit_pct,
 )
 from src.notify.service import NotificationService
 from src.trend.sell_rules import (
+    TRAIL_TRIGGER_FACTOR,
     HoldingRow, SellSignal, detect_sell_signals, fetch_sector_pct_map, match_sector_pct,
 )
 from src.trend.signal_detector import UNKNOWN_SECTOR
 setup_env()
 
 logger = logging.getLogger(__name__)
+
+# 持仓退出状态（移动止盈 peak / 入场价 / 入场日），每日 14:45 运行时更新落盘。
+# peak 只升不降：跨日峰值记忆不依赖行情窗口，加仓/换仓通过入场日判重自然重置。
+EXIT_STATE_FILE = Path(__file__).parent / "data" / "position_exit_state.json"
 
 # 执行结果状态
 ST_SUCCESS = "success"          # 委托成功
@@ -109,32 +119,6 @@ def _f_pct(v) -> str:
         return "-"
 
 
-def _force_clear_signal(position: dict, sector: str,
-                        sector_pct: Optional[float], reason: str) -> Optional[SellSignal]:
-    """硬拦截兜底：行情缺失导致规则判不了时，仍按持仓全量构造清仓信号。
-
-    硬拦截的业务语义是「当日应清仓所有持仓」，不该因为单只行情取不到而漏清。
-    现价取不到时无法构造合法信号（SellSignal 校验 current_price>0），返回 None 由调用方标注。
-    """
-    count = int(position.get("count", 0) or 0)
-    price = float(position.get("current_price", 0) or 0)
-    if count <= 0 or price <= 0:
-        return None
-    return SellSignal(
-        code=str(position.get("code", "") or ""),
-        name=str(position.get("name", "") or "") or str(position.get("code", "") or ""),
-        action="clear",
-        reasons=[reason],
-        current_price=price,
-        cost_price=float(position.get("cost_price", 0) or 0),
-        profit_pct=position_profit_pct(position),
-        count=count,
-        suggest_shares=count,
-        sector=sector,
-        sector_pct=sector_pct,
-    )
-
-
 def execute_sell(sig: SellSignal, position: dict, client: MXMoniClient,
                  dry_run: bool = False) -> Tuple[int, str, str]:
     """对单只持仓执行卖出委托。
@@ -175,29 +159,105 @@ def execute_sell(sig: SellSignal, position: dict, client: MXMoniClient,
     return shares, ST_FAILED, message
 
 
+def _load_exit_state() -> Dict[str, dict]:
+    """读取持仓退出状态（peak/入场价/入场日）。文件缺失或损坏按空状态处理。"""
+    try:
+        if EXIT_STATE_FILE.exists():
+            return json.loads(EXIT_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"退出状态文件读取失败，按空状态处理: {e}")
+    return {}
+
+
+def _save_exit_state(state: Dict[str, dict]) -> None:
+    try:
+        EXIT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        EXIT_STATE_FILE.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning(f"退出状态文件写入失败: {e}")
+
+
+def _build_exit_ctx(df: pd.DataFrame, position: dict, entry_date_str: str,
+                    state_entry: dict) -> Optional[dict]:
+    """构建单只持仓的退出上下文（移动止盈触发价 + 持有交易日数），并更新峰值。
+
+    peak = max(历史峰值, 入场价, 入场日（含）以来最高收盘)，只升不降；
+    入场日推进（加仓）时重置峰值、从新入场日重算——旧峰值不再适用新腿。
+    df 最后一根 bar 为 14:45 近似收盘（尾盘口径），峰值随之更新。
+
+    Returns:
+        {trail_trigger, held_days, peak}；算不出 peak 时返回 None（退出主干跳过）
+    """
+    cost = float(position.get("cost_price", 0) or 0)
+    ed = None
+    if entry_date_str:
+        try:
+            ed = datetime.strptime(entry_date_str[:10], "%Y-%m-%d").date()
+        except ValueError:
+            logger.warning(f"入场日期无法解析：{entry_date_str!r}，到期天数检查跳过")
+
+    stored_ed = str(state_entry.get("entry_date", ""))
+    if ed is not None and stored_ed and entry_date_str[:10] > stored_ed:
+        state_entry["peak"] = 0.0
+        logger.info("入场日推进（加仓），移动止盈峰值重置后重算")
+
+    if ed is not None:
+        since_entry = df.loc[pd.to_datetime(df["date"]) >= pd.Timestamp(ed), "close"]
+        hist_peak = float(since_entry.astype(float).max()) if len(since_entry) else 0.0
+    else:
+        # 入场日缺失：回退全窗口取最高（保守偏高 → 触发价偏高 → 更早触发）
+        hist_peak = float(df["close"].astype(float).max()) if len(df) else 0.0
+
+    prev_peak = float(state_entry.get("peak", 0) or 0)
+    state_entry["peak"] = round(max(prev_peak, hist_peak, cost), 4)
+    state_entry["entry_date"] = entry_date_str[:10] if ed else stored_ed
+    state_entry["entry_price"] = cost
+    state_entry["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    peak = state_entry["peak"]
+    if peak <= 0:
+        return None
+
+    held_days = None
+    if ed is not None:
+        try:
+            from src.trading_calendar import get_trading_dates
+
+            # 持有交易日数不含入场日：T 日收盘买入，T+1 为第 1 个持有日
+            held_days = len(get_trading_dates(ed + timedelta(days=1), datetime.now().date()))
+        except Exception as e:
+            logger.warning(f"持有天数计算失败，到期检查跳过: {e}")
+
+    return {
+        "trail_trigger": round(peak * TRAIL_TRIGGER_FACTOR, 4),
+        "held_days": held_days,
+        "peak": peak,
+    }
+
+
 def run_sell(analyzer, client: MXMoniClient, dry_run: bool = False
-             ) -> Tuple[List[SellExecution], str, bool]:
+             ) -> Tuple[List[SellExecution], str]:
     """检测持仓卖出信号并执行。
 
     Returns:
-        (执行结果列表, 市场状态, 是否硬拦截)
+        (执行结果列表, 市场状态)
     """
-    gate_inputs = fetch_gate_inputs(analyzer.fetcher)
-    _, _, market_summary, regime, hard_intercept = check_market_gate(gate_inputs)
+    _, market_summary, regime = check_market_gate(fetch_index_df())
     logger.info(market_summary)
-    if hard_intercept:
-        logger.warning("硬拦截触发！当日全部持仓按清仓处理")
 
     positions = filter_stock_positions(client.get_positions())
     if not positions:
         logger.info("妙想模拟仓当前无股票持仓")
-        return [], regime, hard_intercept
+        return [], regime
 
     entry_map = get_last_buy_dates_safe(client)
     sector_pct_map = fetch_sector_pct_map()
     if not sector_pct_map:
         logger.warning("板块行情不可用，板块类卖出规则（板块走弱/主线退潮）跳过")
 
+    exit_state = _load_exit_state()
     results: List[SellExecution] = []
     for p in positions:
         code = canonical_stock_code(p.get("code", ""))
@@ -223,25 +283,18 @@ def run_sell(analyzer, client: MXMoniClient, dry_run: bool = False
             if df is not None and len(df) >= 10:
                 df = df.sort_values('date').reset_index(drop=True)
                 df = analyzer.trend_analyzer._calculate_mas(df)
+                exit_ctx = _build_exit_ctx(
+                    df, p, entry_map.get(code, ""), exit_state.setdefault(code, {})
+                )
                 sig = detect_sell_signals(
-                    code, name, df, p, regime, hard_intercept,
+                    code, name, df, p, regime,
                     sector=sector, sector_pct=sector_pct,
                     entry_date=entry_map.get(code, ""),
+                    exit_ctx=exit_ctx,
                 )
             else:
                 sig = None
                 res.data_ok = False
-
-            # 硬拦截兜底：行情缺失也要清仓，否则"全部清仓"被单只取数失败架空
-            if hard_intercept and sig is None:
-                sig = _force_clear_signal(
-                    p, sector, sector_pct, "市场门控硬拦截，全部清仓（行情缺失，按持仓全量清仓）"
-                )
-                if sig is None:
-                    # 判不了 ≠ 可继续持有，归入「行情缺失未判」而不是「继续持有」
-                    res.data_ok = False
-                    res.message = "硬拦截但现价/股数不可用，无法自动清仓"
-                    logger.warning(f"    {name}({code}) {res.message}")
 
             row.signal = sig
             if sig is not None:
@@ -267,18 +320,23 @@ def run_sell(analyzer, client: MXMoniClient, dry_run: bool = False
 
         results.append(res)
 
-    return results, regime, hard_intercept
+    # 已清仓的持仓移出退出状态，其余落盘（peak 只升不降跨日记忆）
+    held_codes = {canonical_stock_code(p.get("code", "")) for p in positions}
+    for gone in set(exit_state) - held_codes:
+        exit_state.pop(gone, None)
+    _save_exit_state(exit_state)
+
+    return results, regime
 
 
-def render_report(results: List[SellExecution], regime: str,
-                  hard_intercept: bool, dry_run: bool) -> str:
+def render_report(results: List[SellExecution], regime: str, dry_run: bool) -> str:
     """渲染成交报告（Markdown）。"""
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     lines = [
-        f"# 趋势策略 — 尾盘卖出执行报告",
+        "# 趋势策略 — 尾盘卖出执行报告",
         "",
         f"**执行时间**：{now}" + ("（试运行，未下单）" if dry_run else ""),
-        f"**市场状态**：{regime}" + ("　🔴 **硬拦截：全部清仓**" if hard_intercept else ""),
+        f"**市场状态**：{regime}",
         f"**持仓检查**：{len(results)} 只股票持仓",
         "",
     ]
@@ -430,12 +488,12 @@ def main() -> int:
         analyzer = SimpleTechnicalAnalyzer()
         client = MXMoniClient()
 
-        results, regime, hard_intercept = run_sell(analyzer, client, dry_run=args.dry_run)
+        results, regime = run_sell(analyzer, client, dry_run=args.dry_run)
         if not results:
             logger.info("无股票持仓，无需出报告")
             return 0
 
-        report = render_report(results, regime, hard_intercept, args.dry_run)
+        report = render_report(results, regime, args.dry_run)
         _save_report(report)
 
         if not args.no_notify:

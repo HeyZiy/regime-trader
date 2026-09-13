@@ -13,8 +13,8 @@
 4. 选股名单当日跳过（趋势破坏/负面清单，仅影响当日结果，次日名单随新一轮妙想选股自然更新）
 
 拦截层（自下而上，越靠下越"硬"）：
-- market_gate：市场环境层，硬拦截时不开仓
-- veto_rules：负面清单（9 条硬否决），任一触发即不进信号池、不看评分
+- market_gate：市场环境层，市场状态不允许时不开仓
+- veto_rules：负面清单（8 条硬否决），任一触发即不进信号池、不看评分
 - skip_rules：趋势破坏跳过（连续2天跌破10日线等）
 - signal_detector：买点形态 + 信号质量门（情绪过热等）
 
@@ -47,20 +47,17 @@ from src.indicators import add_standard_indicators
 from src.config import setup_env
 from src.notify.service import NotificationService
 from src.mx.service import MXService
-from src.mx.position_utils import filter_stock_positions, get_last_buy_dates_safe
+from src.mx.position_utils import filter_stock_positions
 from src.mx.client import MXMoniClient
 from src.market_state.market_gate import (
-    check_market_gate, diagnose_regime, fetch_gate_inputs,
+    check_market_gate, diagnose_regime, fetch_index_df,
 )
 from src.trend.analyzer import StockTrendAnalyzer
-from src.trend.entry_tier import (
-    TIER_TIGHT, resolve_tier, screen_by_tier, tier_rule,
-)
 from src.trend.skip_rules import (
     SkipStats, check_skip_rules_detail,
 )
 from src.trend.veto_rules import (
-    check_external_veto, check_market_veto, fetch_main_net_inflow,
+    check_external_veto, check_market_veto,
     FROM_60D_LOW_MAX, TURNOVER_DAY_MAX,
 )
 from src.trend.signal_detector import (
@@ -131,7 +128,7 @@ class SimpleTechnicalAnalyzer:
         获取股票历史数据（直接从网络获取）
 
         天数口径为自然日：95 天约 65 个交易日，满足负面清单 60 日类规则
-        （V2/V7/V8 需 61 根 K 线）与 MA60 的计算需求。
+        （V2/V7 需 61 根 K 线）与 MA60 的计算需求。
 
         Args:
             code: 股票代码
@@ -526,37 +523,14 @@ def main():
         )
 
         
-        # 4. 市场环境检查 + 调节信号评分（入口取数 → 纯判定）
-        gate_inputs = fetch_gate_inputs(analyzer.fetcher)
-        can_trade, market_conditions, market_summary, market_regime, hard_intercept = check_market_gate(gate_inputs)
+        # 4. 市场环境判定（指数取数 → 纯结构判定）
+        index_df = fetch_index_df()
+        can_trade, market_summary, market_regime = check_market_gate(index_df)
         logger.info(market_summary)
-        # 单独取一次诊断明细（均线排列 / 偏离 MA20 / 命中路径）供报告展示。
-        # 不改 check_market_gate 的返回值，避免影响 etf_observe.py 的调用。
-        regime_diag = diagnose_regime(
-            gate_inputs.get("index_df"), sum(1 for v in market_conditions.values() if v)
-        )
+        # 诊断明细（均线排列 / 偏离 MA20 / 命中路径）供报告展示
+        regime_diag = diagnose_regime(index_df)
         logger.info(f"市场状态判定明细 → {regime_diag.describe()}")
-        if hard_intercept:
-            logger.warning("硬拦截触发！当日应清仓所有持仓，不执行任何买入操作")
 
-        # 开仓规则档位：环境调整落到具体规则（档位收紧 + 亏损限额），不再乘评分系数
-        tier = resolve_tier(market_regime)
-        rule = tier_rule(tier)
-        tier_note = rule.label if rule else "不开仓（未启用档位）"
-        logger.info(f"开仓规则档位：{tier_note}" + (f"（{rule.describe()}）" if rule else ""))
-        # 经 apply_regime 登记档位：漏跑这一步会在渲染层抛异常，
-        # 而不是让 effective_score 静默保持 0 把信号全判成"暂不关注"
-        for s in signals:
-            s.apply_regime(tier, tier_note)
-
-        # 档位收紧过滤：位置（本地）+ 资金确认（收紧档，惰性外部取数）
-        def _net_inflow(code: str, name: str):
-            return fetch_main_net_inflow(code, name, analyzer.mx_service)
-
-        signals, tier_blocked = screen_by_tier(
-            signals, tier,
-            net_inflow_fn=_net_inflow if tier == TIER_TIGHT else None,
-        )
 
         # 4.5 已持仓股票抑制买入信号（避免"持有又提示买入"）
         held_codes = _fetch_held_codes()
@@ -567,12 +541,11 @@ def main():
             signals = filtered
 
         report = generate_technical_report(signals, skipped_stocks,
-                                           market_env=(can_trade, market_conditions, market_summary, market_regime),
+                                           market_env=(can_trade, market_summary, market_regime),
                                            failed_stocks=failed_stocks,
                                            vetoed_stocks=vetoed_stocks,
                                            skip_stats=skip_stats,
-                                           regime_diag=regime_diag,
-                                           tier_blocked=tier_blocked)
+                                           regime_diag=regime_diag)
 
         # 5. 保存报告
         _save_report(report)
