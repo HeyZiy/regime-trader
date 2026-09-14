@@ -143,11 +143,7 @@ class SimpleTechnicalAnalyzer:
             start_str = start_date.strftime('%Y-%m-%d')
             end_str = end_date.strftime('%Y-%m-%d')
 
-            result = self.fetcher.get_daily_data(code, start_str, end_str)
-            if isinstance(result, tuple) and len(result) >= 1:
-                df = result[0]
-            else:
-                df = result
+            df = self.fetcher.get_daily_data(code, start_str, end_str)
 
             if df is not None and hasattr(df, 'empty') and not df.empty:
                 df_latest_date = pd.to_datetime(df['date'].max()).date()

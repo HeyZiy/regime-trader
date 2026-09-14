@@ -22,13 +22,14 @@ import logging
 import os
 import threading
 from datetime import date as date_cls, timedelta
+from pathlib import Path
 from typing import ClassVar, Optional, Dict, Any
 
 import numpy as np
 import pandas as pd
 
 from data_provider.fetchers.base import BaseFetcher
-from data_provider.types import DataFetchError, STANDARD_COLUMNS
+from data_provider.types import KIND_STOCK_DAILY, DataFetchError, STANDARD_COLUMNS
 from data_provider.codes import normalize_stock_code
 
 logger = logging.getLogger(__name__)
@@ -94,12 +95,30 @@ def _code_to_tgw_format(code: str) -> str:
     return None  # 北交所等其他市场暂不支持
 
 
-# InfoData（get_equity_structure 等）本地缓存目录，固定放项目 data/amazingdata_local
-AMAZINGDATA_CACHE_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "data",
-    "amazingdata_local",
-)
+# 项目根目录：本文件位于 <repo>/data_provider/fetchers/ 下，故 parents[2] 是仓库根
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _resolve_cache_dir() -> str:
+    """InfoData（get_equity_structure 等）本地 HDF5 缓存目录。
+
+    与 src/etf/amazing_factors.py 共用同一份缓存（同读 AMAZING_DATA_DIR），
+    避免两处各自落盘、各自冷启动。相对路径按「项目根」解析 —— cron 以项目根为
+    工作目录，但手动从别处运行或被 import 复用时 CWD 会变，直接用相对路径会解析到别处。
+
+    返回值必须带尾部分隔符：SDK 把 local_path 当字符串前缀拼 "infodata/..."，
+    少了分隔符会拼成 AmazingData_local_datainfodata/（文档示例亦为 'D://...//'）。
+    """
+    raw = (os.getenv("AMAZING_DATA_DIR") or "").strip()
+    if raw:
+        path = Path(raw)
+        base = path if path.is_absolute() else _PROJECT_ROOT / path
+    else:
+        base = _PROJECT_ROOT / "data" / "AmazingData_local_data"
+    return str(base) + os.sep
+
+
+AMAZINGDATA_CACHE_DIR = _resolve_cache_dir()
 
 
 class AmazingDataFetcher(BaseFetcher):
@@ -119,6 +138,9 @@ class AmazingDataFetcher(BaseFetcher):
     # 自算该列（不触发回退）；自算失败时回退循环本就跳过主源自身，直接走 akshare，
     # 不把本源当候选回退源可避免"整段日线重拉一遍再自算一次"的无效请求
     SUPPORTS_COLUMNS = {'date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg'}
+
+    # 仅 A 股日线（交易所直连，不覆盖港股/美股/北交所）
+    SUPPORTS = frozenset({(KIND_STOCK_DAILY, "cn")})
 
     # 登录单例
     _login_lock = threading.Lock()
@@ -264,13 +286,18 @@ class AmazingDataFetcher(BaseFetcher):
     # 流通股本（万股）进程级缓存（类属性，全实例共享）：key = tgw 代码，value = 按变动日索引的 Series
     _float_shares_cache: ClassVar[Dict[str, pd.Series]] = {}
 
-    def _fetch_float_shares_series(self, tgw_code: str, begin: int, end: int) -> Optional[pd.Series]:
+    def _fetch_float_shares_series(self, tgw_code: str) -> Optional[pd.Series]:
         """
         获取个股流通A股（万股）的「变动日 → 万股」序列，用于按交易日 ffill。
 
         数据源：InfoData.get_equity_structure 的 FLOAT_A_SHARE（流通A股，单位万股）。
         股本仅在解禁/增发/送转等变动日更新，故需按变动日 ffill 到每个交易日。
         会话内按代码缓存，避免重复请求。
+
+        取数约定（与 src/etf/amazing_factors.py 同款，该组合在本项目已验证可用）：
+        只传 local_path + is_local=False，从服务端取全量并更新本地缓存。
+        不传 begin_date/end_date —— 那是「变动日期」过滤（文档里与本地缓存模式
+        二选一、不可混用），拿 K 线窗口去框会因股本变动稀疏而整段查空。
         """
         if tgw_code in self._float_shares_cache:
             return self._float_shares_cache[tgw_code]
@@ -280,9 +307,7 @@ class AmazingDataFetcher(BaseFetcher):
         eq = info.get_equity_structure(
             [tgw_code],
             local_path=AMAZINGDATA_CACHE_DIR,
-            is_local=True,
-            begin_date=begin,
-            end_date=end,
+            is_local=False,
         )
         if eq is None or eq.empty or "FLOAT_A_SHARE" not in eq.columns:
             return None
@@ -315,10 +340,7 @@ class AmazingDataFetcher(BaseFetcher):
         if tgw_code is None:
             return None
 
-        begin = int(pd.to_datetime(df["date"].min()).strftime("%Y%m%d"))
-        end = int(pd.to_datetime(df["date"].max()).strftime("%Y%m%d"))
-
-        float_wan = self._fetch_float_shares_series(tgw_code, begin, end)
+        float_wan = self._fetch_float_shares_series(tgw_code)
         if float_wan is None:
             return None
 

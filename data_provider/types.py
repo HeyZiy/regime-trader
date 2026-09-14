@@ -18,13 +18,35 @@
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Optional, Dict, Any, Union, Tuple
 from enum import Enum
 
 logger = logging.getLogger(__name__)
 
 STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turnover_rate']
+
+# 数据类型标识（Need.kind）
+KIND_STOCK_DAILY = "stock_daily"
+KIND_REALTIME = "realtime"
+KIND_FUND_FLOW = "fund_flow"
+
+
+@dataclass(frozen=True)
+class Need:
+    """一次取数的需求描述。
+
+    编排层据此找候选数据源，而不是按类名硬编码：每个数据源用
+    BaseFetcher.SUPPORTS 声明自己覆盖的 (kind, market) 组合。
+
+    Attributes:
+        kind: 数据类型，见 KIND_* 常量
+        code: 已规范化的标的代码
+        market: 'cn' / 'hk' / 'us'，由 codes.classify_market 判定
+    """
+    kind: str
+    code: str
+    market: str
 
 
 def unwrap_exception(exc: Exception) -> Exception:
@@ -202,18 +224,12 @@ class UnifiedRealtimeQuote:
             'name': self.name,
             'source': self.source.value,
         }
-        # 只添加非 None 的字段
-        optional_fields = [
-            'price', 'change_pct', 'change_amount', 'volume', 'amount',
-            'volume_ratio', 'turnover_rate', 'amplitude',
-            'open_price', 'high', 'low', 'pre_close',
-            'pe_ratio', 'pb_ratio', 'total_mv', 'circ_mv',
-            'change_60d', 'high_52w', 'low_52w'
-        ]
-        for f in optional_fields:
-            val = getattr(self, f, None)
+        for f in fields(self):
+            if f.name in ('code', 'name', 'source'):
+                continue
+            val = getattr(self, f.name)
             if val is not None:
-                result[f] = val
+                result[f.name] = val
         return result
     
     def has_basic_data(self) -> bool:
@@ -251,67 +267,49 @@ class ChipDistribution:
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
-        return {
-            'code': self.code,
-            'date': self.date,
-            'source': self.source,
-            'profit_ratio': self.profit_ratio,
-            'avg_cost': self.avg_cost,
-            'cost_90_low': self.cost_90_low,
-            'cost_90_high': self.cost_90_high,
-            'concentration_90': self.concentration_90,
-            'concentration_70': self.concentration_70,
-        }
+        return {f.name: getattr(self, f.name) for f in fields(self)}
     
     def get_chip_status(self, current_price: float) -> str:
         """
         获取筹码状态描述
-        
+
         Args:
             current_price: 当前股价
-            
+
         Returns:
             筹码状态描述
         """
-        status_parts = []
-        
+        parts = []
+
         # 获利比例分析
-        if self.profit_ratio >= 0.9:
-            status_parts.append("获利盘极高(获利盘>90%)")
-        elif self.profit_ratio >= 0.7:
-            status_parts.append("获利盘较高(获利盘70-90%)")
-        elif self.profit_ratio >= 0.5:
-            status_parts.append("获利盘中等(获利盘50-70%)")
-        elif self.profit_ratio >= 0.3:
-            status_parts.append("套牢盘中等(套牢盘50-70%)")
-        elif self.profit_ratio >= 0.1:
-            status_parts.append("套牢盘较高(套牢盘70-90%)")
-        else:
-            status_parts.append("套牢盘极高(套牢盘>90%)")
-        
+        profit_label = {0.9: "获利盘极高", 0.7: "获利盘较高", 0.5: "获利盘中等",
+                        0.3: "套牢盘中等", 0.1: "套牢盘较高"}.get(
+            next((t for t in (0.9, 0.7, 0.5, 0.3, 0.1) if self.profit_ratio >= t), 0),
+            "套牢盘极高",
+        )
+        parts.append(f"{profit_label}({self.profit_ratio*100:.0f}%)")
+
         # 筹码集中度分析 (90%集中度 < 10% 表示集中)
-        if self.concentration_90 < 0.08:
-            status_parts.append("筹码高度集中")
-        elif self.concentration_90 < 0.15:
-            status_parts.append("筹码较集中")
-        elif self.concentration_90 < 0.25:
-            status_parts.append("筹码分散度中等")
-        else:
-            status_parts.append("筹码较分散")
-        
+        conc_label = {0.08: "筹码高度集中", 0.15: "筹码较集中",
+                      0.25: "筹码分散度中等"}.get(
+            next((t for t in (0.08, 0.15, 0.25) if self.concentration_90 < t), 1),
+            "筹码较分散",
+        )
+        parts.append(conc_label)
+
         # 成本与现价关系
         if current_price > 0 and self.avg_cost > 0:
             cost_diff = (current_price - self.avg_cost) / self.avg_cost * 100
             if cost_diff > 20:
-                status_parts.append(f"现价高于平均成本{cost_diff:.1f}%")
+                parts.append(f"现价高于平均成本{cost_diff:.1f}%")
             elif cost_diff > 5:
-                status_parts.append(f"现价略高于成本{cost_diff:.1f}%")
+                parts.append(f"现价略高于成本{cost_diff:.1f}%")
             elif cost_diff > -5:
-                status_parts.append("现价接近平均成本")
+                parts.append("现价接近平均成本")
             else:
-                status_parts.append(f"现价低于平均成本{abs(cost_diff):.1f}%")
-        
-        return "，".join(status_parts)
+                parts.append(f"现价低于平均成本{abs(cost_diff):.1f}%")
+
+        return "，".join(parts)
 
 
 class CircuitBreaker:
@@ -368,31 +366,23 @@ class CircuitBreaker:
         """
         state = self._get_state(source)
         current_time = time.time()
-        
+
         if state['state'] == self.CLOSED:
             return True
-        
+
         if state['state'] == self.OPEN:
-            # 检查冷却时间
             time_since_failure = current_time - state['last_failure_time']
             if time_since_failure >= self.cooldown_seconds:
-                # 冷却完成，进入半开状态
                 state['state'] = self.HALF_OPEN
                 state['half_open_calls'] = 0
                 logger.info(f"[熔断器] {source} 冷却完成，进入半开状态")
                 return True
-            else:
-                remaining = self.cooldown_seconds - time_since_failure
-                logger.debug(f"[熔断器] {source} 处于熔断状态，剩余冷却时间: {remaining:.0f}s")
-                return False
-        
-        if state['state'] == self.HALF_OPEN:
-            # 半开状态下限制请求次数
-            if state['half_open_calls'] < self.half_open_max_calls:
-                return True
+            remaining = self.cooldown_seconds - time_since_failure
+            logger.debug(f"[熔断器] {source} 处于熔断状态，剩余冷却时间: {remaining:.0f}s")
             return False
-        
-        return True
+
+        # HALF_OPEN: 限制请求次数
+        return state['half_open_calls'] < self.half_open_max_calls
     
     def record_success(self, source: str) -> None:
         """记录成功请求"""

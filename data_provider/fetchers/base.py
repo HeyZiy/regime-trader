@@ -17,7 +17,7 @@ from typing import Optional, Dict, Any
 
 import pandas as pd
 
-from data_provider.types import DataFetchError, summarize_exception
+from data_provider.types import DataFetchError, Need, summarize_exception
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,17 @@ class BaseFetcher(ABC):
     # None = 未声明（视为可能提供所有标准列）；
     # 列回退 (_backfill_missing_columns) 会先按此过滤，跳过确定没有该列的源，避免无效请求。
     SUPPORTS_COLUMNS: Optional[set] = None
+
+    # 能力声明：本数据源覆盖的 (kind, market) 组合，元素形如 ("stock_daily", "cn")。
+    # None = 未声明（不限制）；编排层按此筛源，避免编排逻辑出现具体数据源类名。
+    # 声明过宽 → 无效请求 + 误导性日志；声明过窄 → 可用源被跳过：按实测能力如实填。
+    SUPPORTS: Optional[frozenset] = None
+
+    def supports(self, need: "Need") -> bool:
+        """本数据源能否满足该需求（能力声明的唯一判定入口）。"""
+        if self.SUPPORTS is None:
+            return True
+        return (need.kind, need.market) in self.SUPPORTS
     
     @abstractmethod
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -88,6 +99,24 @@ class BaseFetcher(ABC):
 
         默认返回 None，表示「该数据源不支持实时行情」。子类若支持实时行情应覆写此方法；
         基类提供此兜底后，调用方无需 hasattr 预检，统一以 None 判断「无数据」。
+        """
+        return None
+
+    def get_main_fund_flow(self, stock_code: str, days: int = 5) -> Optional[pd.DataFrame]:
+        """
+        获取主力资金流向数据（默认抽象方法）
+
+        Args:
+            stock_code: 股票代码
+            days: 获取天数（默认 5 个交易日）
+
+        Returns:
+            DataFrame 包含以下列：
+            - date: 日期
+            - main_net_inflow: 主力净流入（元，正数=净流入，负数=净流出）
+            - 或 None（数据源不支持）
+
+        基类默认返回 None（不声明支持），子类若提供此数据应覆写此方法。
         """
         return None
 

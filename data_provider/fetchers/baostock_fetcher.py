@@ -15,7 +15,6 @@ BaostockFetcher - 备用数据源 2 (Priority 3)
 """
 
 import logging
-import re
 from contextlib import contextmanager
 from typing import Optional, Generator
 
@@ -29,23 +28,11 @@ from tenacity import (
 )
 
 from data_provider.fetchers.base import BaseFetcher
-from data_provider.types import DataFetchError, STANDARD_COLUMNS
-from data_provider.codes import is_bse_code, _is_hk_market
+from data_provider.types import KIND_STOCK_DAILY, DataFetchError, STANDARD_COLUMNS
+from data_provider.codes import is_bse_code, _is_hk_market, is_us_stock_code
 import os
 
 logger = logging.getLogger(__name__)
-
-
-def _is_us_code(stock_code: str) -> bool:
-    """
-    判断代码是否为美股
-    
-    美股代码规则：
-    - 1-5个大写字母，如 'AAPL', 'TSLA'
-    - 可能包含 '.'，如 'BRK.B'
-    """
-    code = stock_code.strip().upper()
-    return bool(re.match(r'^[A-Z]{1,5}(\.[A-Z])?$', code))
 
 
 class BaostockFetcher(BaseFetcher):
@@ -70,6 +57,9 @@ class BaostockFetcher(BaseFetcher):
     priority = int(os.getenv("BAOSTOCK_PRIORITY", "3"))
     # query_history_k_data_plus 请求了 turn 字段，可提供换手率
     SUPPORTS_COLUMNS = {'date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turnover_rate'}
+
+    # 仅 A 股日线（无实时能力；美股/港股/北交所明确拒绝，见 _fetch_raw_data）
+    SUPPORTS = frozenset({(KIND_STOCK_DAILY, "cn")})
     
     def __init__(self):
         """初始化 BaostockFetcher"""
@@ -188,7 +178,7 @@ class BaostockFetcher(BaseFetcher):
         5. 将结果转换为 DataFrame
         """
         # 美股不支持，抛出异常让 DataFetcherManager 切换到其他数据源
-        if _is_us_code(stock_code):
+        if is_us_stock_code(stock_code):
             raise DataFetchError(f"BaostockFetcher 不支持美股 {stock_code}，请使用 AkshareFetcher 或 YfinanceFetcher")
 
         # 港股不支持，抛出异常让 DataFetcherManager 切换到其他数据源

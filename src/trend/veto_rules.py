@@ -37,7 +37,7 @@
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional
 
 import pandas as pd
 
@@ -63,7 +63,6 @@ BIG_DROP_PCT = -7.0               # V4 单日跌幅阈值(%)
 BIG_DROP_MIN_COUNT = 2            # V4 触发所需次数
 FUND_FLOW_DAYS = 5                # V5 主力资金统计天数
 FUND_FLOW_OUTFLOW_PCT = 1.0       # V5 净流出占流通市值比例阈值(%)
-FUND_FLOW_SANITY_PCT = 50.0       # V5 单位合理性上限：净流出超流通市值50%视为单位存疑，放行
 LIMIT_MOVE_DAYS = 3               # V6 涨跌停天数阈值
 LIMIT_MOVE_LOOKBACK = 20          # V6 回溯天数
 FROM_60D_LOW_MAX = 80.0           # V7 距60日最低收盘涨幅上限(%)
@@ -222,14 +221,6 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
-def _to_yuan(value: float, column_name: str) -> float:
-    """按列名中的单位提示把数值换算成元（默认视为元）。"""
-    if "亿" in column_name:
-        return value * 1e8
-    if "万" in column_name:
-        return value * 1e4
-    return value
-
 
 def _parse_datetime(text: str) -> Optional[datetime]:
     """解析常见日期字符串，失败返回 None。"""
@@ -242,36 +233,6 @@ def _parse_datetime(text: str) -> Optional[datetime]:
         except ValueError:
             continue
     return None
-
-
-def _extract_series(resp: Optional[Dict[str, Any]], keywords: Tuple[str, ...]) -> Tuple[str, List[float]]:
-    """从妙想查数响应中提取指标序列。
-
-    Args:
-        resp: query_financial_data 的原始响应
-        keywords: 指标中文名需同时包含的关键词（如 ('主力', '净流入')）
-
-    Returns:
-        (匹配到的指标名, 数值列表)；未匹配到则返回 ("", [])
-    """
-    if not resp:
-        return "", []
-
-    for table_obj in _iter_dicts(resp):
-        table = table_obj.get("table")
-        name_map = table_obj.get("nameMap")
-        if not isinstance(table, dict) or not isinstance(name_map, dict):
-            continue
-        for key, values in table.items():
-            if key == "headName" or not isinstance(values, (list, tuple)):
-                continue
-            column_name = str(name_map.get(key, key))
-            if not all(kw in column_name for kw in keywords):
-                continue
-            nums = [v for v in (_to_float(x) for x in values) if v is not None]
-            if nums:
-                return column_name, nums
-    return "", []
 
 
 def _extract_news_items(resp: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
@@ -335,47 +296,32 @@ def _check_announcement_veto(code: str, name: str, mx_service: Any) -> Optional[
     return None
 
 
-def fetch_main_net_inflow(code: str, name: str, mx_service: Any,
-                          days: int = FUND_FLOW_DAYS) -> Optional[float]:
-    """近 N 日主力资金净流入合计（元）。供 V5（净流出否决）使用。
+def _check_fund_flow_veto(code: str, name: str, fetcher: Any) -> Optional[str]:
+    """V5：近 5 日主力资金净流出 > 流通市值 1% → 返回触发原因，否则 None。
 
-    Returns:
-        净流入合计（元，负数=净流出）；取不到或解析失败返回 None（fail-open）
+    Args:
+        fetcher: DataFetcherManager 实例，用于获取主力资金流和流通市值
     """
-    if mx_service is None:
+    if fetcher is None:
         return None
 
     tag = f"{name}({code})"
+
+    # 使用 fetcher 获取主力资金流（结构化的 akshare/efinance）
     try:
-        resp = mx_service.query_financial_data(f"{name}({code}) 近{days}个交易日 每日主力净流入")
-        column_name, values = _extract_series(resp, keywords=("主力", "净流入"))
+        df = fetcher.get_main_fund_flow(code, days=FUND_FLOW_DAYS)
+        net_flow = df['main_net_inflow'].sum() if df is not None and not df.empty and 'main_net_inflow' in df.columns else None
     except Exception as e:
-        logger.warning(f"  {tag}: 主力资金查询失败，返回 None（{e}）")
-        return None
+        logger.warning(f"  {tag}: V5 fetcher 主力资金获取失败（{e}）")
+        net_flow = None
 
-    if not values:
-        logger.warning(f"  {tag}: 未取到主力净流入序列，返回 None")
-        return None
-
-    recent = values[-days:]
-    recent = [_to_yuan(v, column_name) for v in recent]
-    return sum(recent)
-
-
-def _check_fund_flow_veto(code: str, name: str, mx_service: Any, fetcher: Any) -> Optional[str]:
-    """V5：近 5 日主力资金净流出 > 流通市值 1% → 返回触发原因，否则 None。"""
-    if mx_service is None or fetcher is None:
-        return None
-
-    tag = f"{name}({code})"
-
-    net_flow = fetch_main_net_inflow(code, name, mx_service, days=FUND_FLOW_DAYS)
     if net_flow is None:
         logger.warning(f"  {tag}: V5 主力资金数据缺失，放行")
         return None
     if net_flow >= 0:
         return None
 
+    # 获取流通市值
     try:
         quote = fetcher.get_realtime_quote(code)
     except Exception as e:
@@ -387,20 +333,16 @@ def _check_fund_flow_veto(code: str, name: str, mx_service: Any, fetcher: Any) -
         logger.warning(f"  {tag}: V5 流通市值缺失，放行")
         return None
 
+    # 净流出占比（主力净额与 circ_mv 同为元）
     outflow = abs(net_flow)
     ratio = outflow / circ_mv * 100
-    if ratio > FUND_FLOW_SANITY_PCT:
-        # 净流出不可能超过流通市值的一半，多半是单位换算问题 → 放行并告警
-        logger.warning(
-            f"  {tag}: V5 净流出占流通市值{ratio:.1f}%，疑似单位异常，放行"
-        )
-        return None
 
     if ratio > FUND_FLOW_OUTFLOW_PCT:
         return (
             f"V5 近{FUND_FLOW_DAYS}日主力净流出{outflow / 1e8:.2f}亿，"
             f"占流通市值{ratio:.2f}%>{FUND_FLOW_OUTFLOW_PCT}%"
         )
+
     return None
 
 
@@ -418,8 +360,8 @@ def check_external_veto(
     Args:
         code: 股票代码
         name: 股票名称
-        mx_service: MXService 实例（None 时跳过全部外部规则）
-        fetcher: DataFetcherManager 实例，用于取流通市值
+        mx_service: MXService 实例（V1 公告规则仍使用，V5 主力资金已迁移到 fetcher）
+        fetcher: DataFetcherManager 实例，用于获取主力资金流和流通市值
 
     Returns:
         VetoResult；外部规则动作均为 skip（暂时性风险，仅跳过当日信号）
@@ -430,7 +372,7 @@ def check_external_veto(
     if reason:
         result.add(reason)
 
-    reason = _check_fund_flow_veto(code, name, mx_service, fetcher)
+    reason = _check_fund_flow_veto(code, name, fetcher)
     if reason:
         result.add(reason)
 

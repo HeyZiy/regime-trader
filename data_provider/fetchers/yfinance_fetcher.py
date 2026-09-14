@@ -32,7 +32,10 @@ from tenacity import (
 )
 
 from data_provider.fetchers.base import BaseFetcher
-from data_provider.types import DataFetchError, STANDARD_COLUMNS, UnifiedRealtimeQuote, RealtimeSource
+from data_provider.types import (
+    KIND_REALTIME, KIND_STOCK_DAILY,
+    DataFetchError, STANDARD_COLUMNS, UnifiedRealtimeQuote, RealtimeSource,
+)
 from data_provider.codes import is_bse_code
 from data_provider.us_index_mapping import get_us_index_yf_symbol, is_us_stock_code
 
@@ -76,6 +79,13 @@ class YfinanceFetcher(BaseFetcher):
     priority = int(os.getenv("YFINANCE_PRIORITY", "4"))
     # Yahoo 日线不提供 A 股换手率，列回退时跳过本源
     SUPPORTS_COLUMNS = {'date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg'}
+
+    # 日线覆盖 A股/港股/美股（含美股指数），是 A 股链路的兜底源；
+    # 实时仅美股：港股实时报价质量未验证，不列为候选（港股实时由 akshare 独家承担）
+    SUPPORTS = frozenset({
+        (KIND_STOCK_DAILY, "cn"), (KIND_STOCK_DAILY, "hk"), (KIND_STOCK_DAILY, "us"),
+        (KIND_REALTIME, "us"),
+    })
 
     def __init__(self):
         """初始化 YfinanceFetcher"""

@@ -39,16 +39,24 @@ from tenacity import (
 )
 from typing import Optional, Dict, Any, Tuple
 from data_provider.fetchers.base import BaseFetcher
+from data_provider.stats import calc_market_stats
 from data_provider.types import (
+    KIND_FUND_FLOW, KIND_REALTIME, KIND_STOCK_DAILY,
     DataFetchError, RateLimitError, STANDARD_COLUMNS,
     UnifiedRealtimeQuote, RealtimeSource,
     get_realtime_circuit_breaker, safe_float, safe_int,
 )
-from data_provider.codes import is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code
+from data_provider.codes import is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code, is_etf_code
+from data_provider.codes import _is_hk_market
 from data_provider.us_index_mapping import is_us_stock_code
 
 # RealtimeQuote 别名，统一实时报价类型引用
 RealtimeQuote = UnifiedRealtimeQuote
+
+
+def is_hk_stock_code(stock_code: str) -> bool:
+    """Public API: determine if a stock code is a Hong Kong stock."""
+    return _is_hk_market(stock_code)
 
 
 logger = logging.getLogger(__name__)
@@ -84,92 +92,6 @@ _etf_realtime_cache: Dict[str, Any] = {
     'timestamp': 0,
     'ttl': 1200  # 20分钟缓存有效期
 }
-
-
-def _is_etf_code(stock_code: str) -> bool:
-    """
-    判断代码是否为 ETF 基金
-    
-    ETF 代码规则：
-    - 上交所 ETF: 51xxxx, 52xxxx, 56xxxx, 58xxxx
-    - 深交所 ETF: 15xxxx, 16xxxx, 18xxxx
-    
-    Args:
-        stock_code: 股票/基金代码
-        
-    Returns:
-        True 表示是 ETF 代码，False 表示是普通股票代码
-    """
-    etf_prefixes = ('51', '52', '56', '58', '15', '16', '18')
-    code = stock_code.strip().split('.')[0]
-    return code.startswith(etf_prefixes) and len(code) == 6
-
-
-def _is_hk_code(stock_code: str) -> bool:
-    """
-    判断代码是否为港股
-
-    港股代码规则：
-    - 5位数字代码，如 '00700' (腾讯控股)
-    - 部分港股代码可能带有前缀，如 'hk00700', 'hk1810'
-
-    Args:
-        stock_code: 股票代码
-
-    Returns:
-        True 表示是港股代码，False 表示不是港股代码
-    """
-    # 去除可能的 'hk' 前缀并检查是否为纯数字
-    code = stock_code.strip().lower()
-    if code.endswith('.hk'):
-        numeric_part = code[:-3]
-        return numeric_part.isdigit() and 1 <= len(numeric_part) <= 5
-    if code.startswith('hk'):
-        # 带 hk 前缀的一定是港股，去掉前缀后应为纯数字（1-5位）
-        numeric_part = code[2:]
-        return numeric_part.isdigit() and 1 <= len(numeric_part) <= 5
-    # 无前缀时，5位纯数字才视为港股（避免误判 A 股代码）
-    return code.isdigit() and len(code) == 5
-
-
-def is_hk_stock_code(stock_code: str) -> bool:
-    """
-    Public API: determine if a stock code is a Hong Kong stock.
-
-    Delegates to _is_hk_code for internal compatibility.
-
-    Args:
-        stock_code: Stock code (e.g. '00700', 'hk00700')
-
-    Returns:
-        True if HK stock, False otherwise
-    """
-    return _is_hk_code(stock_code)
-
-
-def _is_us_code(stock_code: str) -> bool:
-    """
-    判断代码是否为美股股票（不包括美股指数）。
-
-    委托给 us_index_mapping 模块的 is_us_stock_code()。
-
-    Args:
-        stock_code: 股票代码
-
-    Returns:
-        True 表示是美股代码，False 表示不是美股代码
-
-    Examples:
-        >>> _is_us_code('AAPL')
-        True
-        >>> _is_us_code('TSLA')
-        True
-        >>> _is_us_code('SPX')
-        False
-        >>> _is_us_code('600519')
-        False
-    """
-    return is_us_stock_code(stock_code)
 
 
 def _to_sina_tx_symbol(stock_code: str) -> str:
@@ -264,7 +186,13 @@ class AkshareFetcher(BaseFetcher):
     priority = int(os.getenv("AKSHARE_PRIORITY", "0"))
     # 东财/新浪日线均含换手率列
     SUPPORTS_COLUMNS = {'date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turnover_rate'}
-    
+
+    # 日线/实时覆盖 A股+港股；主力资金流仅 A股。美股日线明确拒绝（复权问题，见 _fetch_raw_data）
+    SUPPORTS = frozenset({
+        (KIND_STOCK_DAILY, "cn"), (KIND_STOCK_DAILY, "hk"),
+        (KIND_REALTIME, "cn"), (KIND_REALTIME, "hk"),
+        (KIND_FUND_FLOW, "cn"),
+    })
     def __init__(self, sleep_min: float = 2.0, sleep_max: float = 5.0):
         """
         初始化 AkshareFetcher
@@ -338,7 +266,7 @@ class AkshareFetcher(BaseFetcher):
         5. 处理返回数据
         """
         # 根据代码类型选择不同的获取方法
-        if _is_us_code(stock_code):
+        if is_us_stock_code(stock_code):
             # 美股：akshare 的 stock_us_daily 接口复权存在已知问题（参见 Issue #311）
             # 交由 YfinanceFetcher 处理，确保复权价格一致
             raise DataFetchError(
@@ -346,7 +274,7 @@ class AkshareFetcher(BaseFetcher):
             )
         elif _is_hk_code(stock_code):
             return self._fetch_hk_data(stock_code, start_date, end_date)
-        elif _is_etf_code(stock_code):
+        elif is_etf_code(stock_code):
             return self._fetch_etf_data(stock_code, start_date, end_date)
         else:
             return self._fetch_stock_data(stock_code, start_date, end_date)
@@ -798,13 +726,13 @@ class AkshareFetcher(BaseFetcher):
         circuit_breaker = get_realtime_circuit_breaker()
 
         # 根据代码类型选择不同的获取方法
-        if _is_us_code(stock_code):
+        if is_us_stock_code(stock_code):
             # 美股不使用 Akshare，由 YfinanceFetcher 处理
             logger.debug(f"[API跳过] {stock_code} 是美股，Akshare 不支持美股实时行情")
             return None
         elif _is_hk_code(stock_code):
             return self._get_hk_realtime_quote(stock_code)
-        elif _is_etf_code(stock_code):
+        elif is_etf_code(stock_code):
             source_key = "akshare_etf"
             if not circuit_breaker.is_available(source_key):
                 logger.warning(f"[熔断] 数据源 {source_key} 处于熔断状态，跳过")
@@ -1426,7 +1354,7 @@ class AkshareFetcher(BaseFetcher):
             logger.info("[API调用] ak.stock_zh_a_spot_em() 获取市场统计...")
             df = ak.stock_zh_a_spot_em()
             if df is not None and not df.empty:
-                return self._calc_market_stats(df)
+                return calc_market_stats(df)
         except Exception as e:
             logger.warning(f"[Akshare] 东财接口获取市场统计失败: {e}，尝试新浪接口")
 
@@ -1438,100 +1366,12 @@ class AkshareFetcher(BaseFetcher):
             logger.info("[API调用] ak.stock_zh_a_spot() 获取市场统计(新浪)...")
             df = ak.stock_zh_a_spot()
             if df is not None and not df.empty:
-                return self._calc_market_stats(df)
+                return calc_market_stats(df)
         except Exception as e:
             logger.error(f"[Akshare] 新浪接口获取市场统计也失败: {e}")
 
         return None
 
-    def _calc_market_stats(
-        self,
-        df: pd.DataFrame,
-        ) -> Optional[Dict[str, Any]]:
-        """从行情 DataFrame 计算涨跌统计。"""
-        import numpy as np
-
-        df = df.copy()
-        
-        # 1. 提取基础比对数据：最新价、昨收
-        # 兼容不同接口返回的列名 sina/em efinance tushare xtdata
-        code_col = next((c for c in ['代码', '股票代码', 'ts_code','stock_code'] if c in df.columns), None)
-        name_col = next((c for c in ['名称', '股票名称','name','name'] if c in df.columns), None)
-        close_col = next((c for c in ['最新价', '最新价', 'close','lastPrice'] if c in df.columns), None)
-        pre_close_col = next((c for c in ['昨收', '昨日收盘', 'pre_close','lastClose'] if c in df.columns), None)
-        amount_col = next((c for c in ['成交额', '成交额', 'amount','amount'] if c in df.columns), None) 
-        
-        limit_up_count = 0
-        limit_down_count = 0
-        up_count = 0
-        down_count = 0
-        flat_count = 0
-
-        for code, name, current_price, pre_close, amount in zip(
-            df[code_col], df[name_col], df[close_col], df[pre_close_col], df[amount_col]
-        ):
-            
-            # 停牌过滤 efinance 的停牌数据有时候会缺失价格显示为 '-'，em 显示为none
-            if pd.isna(current_price) or pd.isna(pre_close) or current_price in ['-'] or pre_close in ['-'] or amount == 0:
-                continue
-            
-            # em、efinance 为str 需要转换为float
-            current_price = float(current_price)
-            pre_close = float(pre_close)
-            
-            # 获取去除前缀的纯数字代码
-            pure_code = normalize_stock_code(str(code)) 
-
-            # A. 确定每只股票的涨跌幅比例 (使用纯数字代码判断)
-            if is_bse_code(pure_code): 
-                ratio = 0.30
-            elif is_kc_cy_stock(pure_code): #pure_code.startswith(('688', '30')):
-                ratio = 0.20
-            elif is_st_stock(name): #'ST' in str_name:
-                ratio = 0.05
-            else:
-                ratio = 0.10
-
-            # B. 严格按照 A 股规则计算涨跌停价：昨收 * (1 ± 比例) -> 四舍五入保留2位小数
-            limit_up_price = np.floor(pre_close * (1 + ratio) * 100 + 0.5) / 100.0
-            limit_down_price = np.floor(pre_close * (1 - ratio) * 100 + 0.5) / 100.0
-
-            limit_up_price_Tolerance = round(abs(pre_close * (1 + ratio) - limit_up_price), 10)
-            limit_down_price_Tolerance = round(abs(pre_close * (1 - ratio) - limit_down_price), 10)
-
-            # C. 精确比对
-            if current_price > 0 :
-                is_limit_up = (current_price > 0) and (abs(current_price - limit_up_price) <= limit_up_price_Tolerance)
-                is_limit_down = (current_price > 0) and (abs(current_price - limit_down_price) <= limit_down_price_Tolerance)
-
-                if is_limit_up:
-                    limit_up_count += 1
-                if is_limit_down:
-                    limit_down_count += 1
-
-                if current_price > pre_close:
-                    up_count += 1
-                elif current_price < pre_close:
-                    down_count += 1
-                else:
-                    flat_count += 1
-                
-        # 统计数量
-        stats = {
-            'up_count': up_count,
-            'down_count': down_count,
-            'flat_count': flat_count,
-            'limit_up_count': limit_up_count,
-            'limit_down_count': limit_down_count,
-            'total_amount': 0.0,
-        }
-        
-        # 成交额统计
-        if amount_col and amount_col in df.columns:
-            df[amount_col] = pd.to_numeric(df[amount_col], errors='coerce')
-            stats['total_amount'] = (df[amount_col].sum() / 1e8)
-            
-        return stats
 
     def get_sector_pct_map(self) -> Dict[str, float]:
         """获取全量行业板块当日涨跌幅 {板块名: 涨跌幅%}。
@@ -1577,3 +1417,68 @@ class AkshareFetcher(BaseFetcher):
         except Exception as e:
             logger.error(f"[Akshare] 东财接口获取板块行情也失败: {e}")
             return {}
+    def get_main_fund_flow(self, stock_code: str, days: int = 5) -> Optional[pd.DataFrame]:
+        """
+        获取主力资金流向数据
+
+        Args:
+            stock_code: 股票代码（如 '002357'）
+            days: 获取天数（默认 5 个交易日）
+
+        Returns:
+            DataFrame 包含以下列：
+            - date: 日期
+            - main_net_inflow: 主力净流入（元，正数=净流入，负数=净流出）
+            - 或 None（数据源不支持或获取失败）
+        """
+        import akshare as ak
+
+        # 解析市场标识：akshare 内部 market_map = {sh:1, sz:0, bj:0}，
+        # 深市与北交所最终是同一个 secid（0.xxxxxx），故 6 开头的走 sh、其余走 sz 即覆盖全市场。
+        market = "sh" if stock_code.startswith("6") else "sz"
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            logger.info(f"[API调用] ak.stock_individual_fund_flow() 获取 {stock_code} 主力资金流...")
+            df = ak.stock_individual_fund_flow(stock=stock_code, market=market)
+
+            if df is None or df.empty:
+                logger.warning(f"[Akshare] {stock_code} 主力资金流数据为空")
+                return None
+
+            # 标准化列名
+            # 注意：东财接口同时返回「主力净流入-净额」与「主力净流入-净占比」，
+            # 两者都含"主力/净流入"关键词，必须排除占比列，否则会重名成两列
+            # main_net_inflow，调用方取列得到 DataFrame 而非 Series。
+            column_mapping = {}
+            for col in df.columns:
+                col_str = str(col).strip()
+                if '日期' in col_str or 'date' in col_str.lower():
+                    column_mapping[col] = 'date'
+                elif '主力' in col_str and '净流入' in col_str and '占比' not in col_str:
+                    column_mapping[col] = 'main_net_inflow'
+
+            df = df.rename(columns=column_mapping)
+
+            # 确保必需的列存在
+            if 'date' not in df.columns or 'main_net_inflow' not in df.columns:
+                logger.warning(f"[Akshare] {stock_code} 主力资金流数据格式异常: {df.columns.tolist()}")
+                return None
+
+            # 转换数据类型
+            df['date'] = pd.to_datetime(df['date'])
+            df['main_net_inflow'] = pd.to_numeric(df['main_net_inflow'], errors='coerce')
+
+            # 单位：东财 fflow/daykline 的 f52 原始即为「元」，akshare 原样透传，不做换算
+
+            # 取最近 N 天，按日期升序返回
+            df = df.sort_values('date', ascending=False).head(days).sort_values('date').reset_index(drop=True)
+
+            logger.info(f"[Akshare] {stock_code} 获取主力资金流成功: {len(df)} 天")
+            return df[['date', 'main_net_inflow']]
+
+        except Exception as e:
+            logger.error(f"[Akshare] {stock_code} 获取主力资金流失败: {e}")
+            return None

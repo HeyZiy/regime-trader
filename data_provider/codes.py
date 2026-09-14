@@ -6,6 +6,7 @@
 
 纯函数，不碰网络。集中存放项目所有代码判定规则：
 - normalize_stock_code / canonical_stock_code：代码归一化
+- classify_market：市场归类 cn/hk/us（编排层按此匹配数据源能力声明）
 - is_bse_code / is_st_stock / is_kc_cy_stock / _is_hk_market / is_etf_code：市场/类型判定
 - ETF_PREFIXES：ETF 码族常量
 - _split_prefix：sh/sz/bj 前缀拆分
@@ -91,6 +92,20 @@ def _is_hk_market(code: str) -> bool:
 
 
 
+def classify_market(code: str) -> str:
+    """把代码归到 cn / hk / us 三类市场，供编排层做数据源能力匹配。
+
+    判定口径与 DataFetcherManager 的路由一致：港股走 _is_hk_market，
+    美股（含美股指数）走 us_index_mapping，其余归 A 股（含 ETF/北交所）。
+    """
+    if _is_hk_market(code):
+        return "hk"
+    from .us_index_mapping import is_us_index_code, is_us_stock_code
+    if is_us_index_code(code) or is_us_stock_code(code):
+        return "us"
+    return "cn"
+
+
 def is_bse_code(code: str) -> bool:
     """
     Check if the code is a Beijing Stock Exchange (BSE) A-share code.
@@ -157,4 +172,15 @@ def is_etf_code(code: str) -> bool:
     """按码族判定是否为 ETF（51/52/56/58/15/16/18，码族→市场无歧义）。"""
     num, _ = _split_prefix(code)
     return num[:2] in ETF_PREFIXES
+
+
+def is_us_stock_code(code: str) -> bool:
+    """判定代码是否为美股股票（排除美股指数）。
+
+    美股代码规则：
+    - 1-5个大写字母，如 'AAPL', 'TSLA'
+    - 可能包含 '.'，如 'BRK.B'
+    """
+    c = (code or "").strip().upper()
+    return bool(re.match(r'^[A-Z]{1,5}(\.[A-Z])?$', c))
 

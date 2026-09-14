@@ -4,44 +4,28 @@
 数据源策略管理器 DataFetcherManager
 ===================================
 
-管理一组已实例化的 fetcher（带凭证），提供：
-- get_daily_data：个股日线多源（AmazingData > Tushare > akshare > efinance > ...）
-- get_realtime_quote：实时报价（委托 realtime.merge_realtime_quotes 跨源合并）
-- get_market_stats：市场涨跌统计
+持有已实例化的 fetcher（带凭证），把入口调用转成「需求 + 数据源集合」的编排调用：
+- get_daily_data：个股日线 → daily.fetch_stock_daily（failover + 新鲜度校验 + 换手率回补）
+- get_realtime_quote：实时报价 → 美股/港股按能力声明取源，A 股委托 realtime.merge_realtime_quotes
+- get_market_stats / get_main_fund_flow：路由.routing.query_first（多源取首个非空）
+- 候选筛选统一走 routing.supporting（能力声明，编排层不出现数据源类名）
 
-ETF/指数日线不归本模块管，见 bars.py。
+分层：codes/classify_market（市场归类）→ routing（筛源 + failover）→ daily/realtime（策略）
+→ 本类（构造与持有 fetcher 集合）。ETF/指数日线见 bars.py。
 """
 import logging
-import time
-from datetime import date, timedelta
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Dict, Any
 
 import pandas as pd
 
 from data_provider.fetchers.base import BaseFetcher
-from .codes import normalize_stock_code, _is_hk_market
-from .types import DataFetchError, summarize_exception
+from .codes import normalize_stock_code, classify_market, _is_hk_market
+from .daily import fetch_stock_daily
+from .routing import query_first, supporting
+from .types import KIND_FUND_FLOW, KIND_REALTIME, KIND_STOCK_DAILY, Need
 from .realtime import merge_realtime_quotes
 
 logger = logging.getLogger(__name__)
-
-
-def _clamp_to_last_trading_day(d: date) -> date:
-    """把日期收敛到 ≤ d 的最近交易日。
-
-    新鲜度检查的目标日期不能直接用调用方传入的 end_date（常为 date.today()）：
-    周末/节假日不是交易日，行情永远不会有当天的 K 线，直接比对会把整条数据源链
-    误判为"数据过期"（如 2026-09-05 周六全池失败）。
-    日历拉取失败时 trading_calendar 按约定返回空列表 → 退化为周一~周五兜底
-    （周末回退到周五，节假日情形宁可放行也不误杀）。
-    """
-    from src.trading_calendar import get_trading_dates
-    trading_days = get_trading_dates(d - timedelta(days=30), d)
-    if trading_days:
-        return trading_days[-1]
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
 
 
 def get_fetcher():
@@ -143,18 +127,19 @@ class DataFetcherManager:
 
     
     def get_daily_data(
-        self, 
+        self,
         stock_code: str,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         days: int = 30
-    ) -> Tuple[pd.DataFrame, str]:
+    ) -> pd.DataFrame:
         """
         获取日线数据（自动切换数据源）
         
-        故障切换策略：
-        1. 美股指数/美股股票直接路由到 YfinanceFetcher
-        2. 其他代码从最高优先级数据源开始尝试
+        数据源筛选与切换：
+        1. 按市场归类（codes.classify_market）+ 各源能力声明（BaseFetcher.SUPPORTS）筛出候选，
+           不按数据源类名判断——美股日线因此天然只剩 YfinanceFetcher
+        2. 候选中从最高优先级数据源开始尝试
         3. 捕获异常后自动切换到下一个
         4. 记录每个数据源的失败原因
         5. 所有数据源失败后抛出详细异常
@@ -166,190 +151,29 @@ class DataFetcherManager:
             days: 获取天数
             
         Returns:
-            Tuple[DataFrame, str]: (数据, 成功的数据源名称)
+            DataFrame: 标准化日线数据（命中哪个数据源见日志）
             
         Raises:
             DataFetchError: 所有数据源都失败时抛出
         """
-        from .us_index_mapping import is_us_index_code, is_us_stock_code
-
-        # Normalize code (strip SH/SZ prefix etc.)
-        stock_code = normalize_stock_code(stock_code)
-
-        errors = []
-        total_fetchers = len(self._fetchers)
-        request_start = time.time()
-
-        # 快速路径：美股指数与美股股票直接路由到 YfinanceFetcher
-        if is_us_index_code(stock_code) or is_us_stock_code(stock_code):
-            for attempt, fetcher in enumerate(self._fetchers, start=1):
-                if fetcher.name == "YfinanceFetcher":
-                    try:
-                        logger.info(
-                            f"[数据源尝试 {attempt}/{total_fetchers}] [{fetcher.name}] "
-                            f"美股/美股指数 {stock_code} 直接路由..."
-                        )
-                        df = fetcher.get_daily_data(
-                            stock_code=stock_code,
-                            start_date=start_date,
-                            end_date=end_date,
-                            days=days,
-                        )
-                        if df is not None and not df.empty:
-                            elapsed = time.time() - request_start
-                            logger.info(
-                                f"[数据源完成] {stock_code} 使用 [{fetcher.name}] 获取成功: "
-                                f"rows={len(df)}, elapsed={elapsed:.2f}s"
-                            )
-                            return df, fetcher.name
-                    except Exception as e:
-                        error_type, error_reason = summarize_exception(e)
-                        error_msg = f"[{fetcher.name}] ({error_type}) {error_reason}"
-                        logger.warning(
-                            f"[数据源失败 {attempt}/{total_fetchers}] [{fetcher.name}] {stock_code}: "
-                            f"error_type={error_type}, reason={error_reason}"
-                        )
-                        errors.append(error_msg)
-                    break
-            # YfinanceFetcher failed or not found
-            error_summary = f"美股/美股指数 {stock_code} 获取失败:\n" + "\n".join(errors)
-            elapsed = time.time() - request_start
-            logger.error(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
-            raise DataFetchError(error_summary)
-
-        for attempt, fetcher in enumerate(self._fetchers, start=1):
-            try:
-                logger.info(f"[数据源尝试 {attempt}/{total_fetchers}] [{fetcher.name}] 获取 {stock_code}...")
-                df = fetcher.get_daily_data(
-                    stock_code=stock_code,
-                    start_date=start_date,
-                    end_date=end_date,
-                    days=days
-                )
-                
-                if df is not None and not df.empty:
-                    # 检查数据新鲜度：最新日期必须 >= 请求截止日对应的最近交易日
-                    # （end_date 本身可能是周末/节假日，须先收敛，见 _clamp_to_last_trading_day）
-                    try:
-                        df_latest = pd.to_datetime(df['date'].max()).date()
-                        target_date = pd.to_datetime(end_date).date() if isinstance(end_date, str) else end_date
-                        target_date = _clamp_to_last_trading_day(target_date)
-                        # 简单判断：如果数据最新日期 < 目标日期，视为过期
-                        if df_latest < target_date:
-                            raise DataFetchError(
-                                f"数据过期(最新:{df_latest}, 需要:{target_date})"
-                            )
-                    except DataFetchError:
-                        raise
-                    except Exception as e:
-                        # 新鲜度检查出错，记录但继续使用数据
-                        logger.debug(f"[{fetcher.name}] 数据新鲜度检查失败: {e}")
-                    
-                    elapsed = time.time() - request_start
-                    logger.info(
-                        f"[数据源完成] {stock_code} 使用 [{fetcher.name}] 获取成功: "
-                        f"rows={len(df)}, elapsed={elapsed:.2f}s"
-                    )
-                    # 主源缺失关键列时从备用源补齐；补齐后仍缺失则告警（交由下游降级/跳过）
-                    df = self._backfill_missing_columns(
-                        df, stock_code, start_date, end_date, days, primary_name=fetcher.name
-                    )
-                    return df, fetcher.name
-                    
-            except Exception as e:
-                error_type, error_reason = summarize_exception(e)
-                error_msg = f"[{fetcher.name}] ({error_type}) {error_reason}"
-                logger.warning(
-                    f"[数据源失败 {attempt}/{total_fetchers}] [{fetcher.name}] {stock_code}: "
-                    f"error_type={error_type}, reason={error_reason}"
-                )
-                errors.append(error_msg)
-                if attempt < total_fetchers:
-                    next_fetcher = self._fetchers[attempt]
-                    logger.info(f"[数据源切换] {stock_code}: [{fetcher.name}] -> [{next_fetcher.name}]")
-                # 继续尝试下一个数据源
-                continue
-        
-        # 所有数据源都失败
-        error_summary = f"所有数据源获取 {stock_code} 失败:\n" + "\n".join(errors)
-        elapsed = time.time() - request_start
-        logger.error(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
-        raise DataFetchError(error_summary)
+        code = normalize_stock_code(stock_code)
+        need = Need(KIND_STOCK_DAILY, code, classify_market(code))
+        return fetch_stock_daily(
+            need, self._fetchers, start_date=start_date, end_date=end_date, days=days
+        )
     
 
 
     
-    # 主源未提供、需从备用源补齐的关键列（当前仅换手率）。
-    # 各 fetcher 出口已归一化为 STANDARD_COLUMNS，故只按标准列名对齐补齐，
-    # 不覆盖主源已有有效数据；补齐后仍整列缺失则告警，交由下游降级/跳过处理。
-    # 回退前先按各源的 SUPPORTS_COLUMNS 能力声明过滤，跳过日线接口确定没有该列的源。
-    _BACKFILL_COLUMNS = ['turnover_rate']
-
-    def _backfill_missing_columns(
-        self,
-        primary_df: pd.DataFrame,
-        stock_code: str,
-        start_date: Optional[str],
-        end_date: Optional[str],
-        days: int,
-        primary_name: str,
-    ) -> pd.DataFrame:
-        """主源缺失关键列时从其余数据源补齐（按标准化 'date' 列对齐），并告警仍缺失的列。"""
-        if primary_df is None or primary_df.empty:
-            return primary_df
-        for col in self._BACKFILL_COLUMNS:
-            if col in primary_df.columns and not primary_df[col].isna().all():
-                continue  # 主源已有有效数据，无需补齐
-            for fb in self._fetchers:
-                if fb.name == primary_name:
-                    continue  # 不从主源自身补齐
-                if fb.SUPPORTS_COLUMNS is not None and col not in fb.SUPPORTS_COLUMNS:
-                    logger.debug(
-                        f"[列回退] {stock_code} 跳过 [{fb.name}]：其日线接口不提供 '{col}'"
-                    )
-                    continue  # 该源确定没有此列，不发无效请求
-                try:
-                    sub = fb.get_daily_data(
-                        stock_code=stock_code,
-                        start_date=start_date,
-                        end_date=end_date,
-                        days=days,
-                    )
-                except Exception as e:
-                    logger.debug(f"[列回退] {stock_code} 从 [{fb.name}] 补齐 '{col}' 失败: {e}")
-                    continue
-                if sub is None or sub.empty or col not in sub.columns or sub[col].isna().all():
-                    continue
-                filled = primary_df['date'].map(dict(zip(sub['date'], sub[col])))
-                if col not in primary_df.columns:
-                    primary_df[col] = filled
-                else:
-                    missing = primary_df[col].isna()
-                    primary_df.loc[missing, col] = filled[missing].values
-                logger.info(
-                    f"[列回退] {stock_code} 从 [{fb.name}] 补齐缺失列 '{col}' "
-                    f"(主源 {primary_name} 未提供)"
-                )
-                break
-            # 遍历所有备用源后仍缺失 → 告警，下游降级/跳过处理
-            if col not in primary_df.columns or primary_df[col].isna().all():
-                logger.warning(
-                    f"[数据缺失] {stock_code} 关键列 '{col}' 在所有数据源均缺失，"
-                    f"依赖该列的信号/剔除逻辑将跳过或降级处理"
-                )
-        return primary_df
-
     def get_realtime_quote(self, stock_code: str):
         """
         获取实时行情数据（自动故障切换）
         
-        故障切换策略（按配置的优先级）：
-        1. 美股：使用 YfinanceFetcher.get_realtime_quote()
-        2. EfinanceFetcher.get_realtime_quote()
-        3. AkshareFetcher.get_realtime_quote(source="em")  - 东财
-        4. AkshareFetcher.get_realtime_quote(source="sina") - 新浪
-        5. AkshareFetcher.get_realtime_quote(source="tencent") - 腾讯
-        6. 返回 None（降级兜底）
+        取数路径（按市场分流）：
+        1. 美股/美股指数 → 能力声明 (realtime, us) 的源（当前仅 YfinanceFetcher）
+        2. 港股 → 能力声明 (realtime, hk) 的源（当前仅 AkshareFetcher，走 source="hk"）
+        3. A 股 → 委托 realtime.merge_realtime_quotes 按 source_priority 跨源合并
+        4. 全部失败返回 None（降级兜底）
         
         Args:
             stock_code: 股票代码
@@ -360,7 +184,7 @@ class DataFetcherManager:
         # Normalize code (strip SH/SZ prefix etc.)
         stock_code = normalize_stock_code(stock_code)
 
-        from data_provider.fetchers.akshare_fetcher import _is_us_code
+        from data_provider.codes import is_us_stock_code
         from .us_index_mapping import is_us_index_code
         from src.config import get_config
 
@@ -376,18 +200,18 @@ class DataFetcherManager:
             return self._quote_from_yfinance(stock_code, "美股指数")
 
         # 美股单独处理，使用 YfinanceFetcher
-        if _is_us_code(stock_code):
+        if is_us_stock_code(stock_code):
             return self._quote_from_yfinance(stock_code, "美股")
 
         # 港股实时行情只走港股专用入口，避免按 A 股 source_priority
         # 反复触发同一个 ak.stock_hk_spot_em() 接口。
+        # source="hk" 是 akshare 的港股入口；当前仅 AkshareFetcher 声明 (realtime, hk)
         if _is_hk_market(stock_code):
-            fetcher = self._fetcher_by_name("AkshareFetcher")
-            if fetcher is not None:
+            for fetcher in supporting(self._fetchers, Need(KIND_REALTIME, stock_code, "hk")):
                 try:
                     quote = fetcher.get_realtime_quote(stock_code, source="hk")
                     if quote is not None and quote.has_basic_data():
-                        logger.info(f"[实时行情] 港股 {stock_code} 成功获取 (来源: akshare_hk)")
+                        logger.info(f"[实时行情] 港股 {stock_code} 成功获取 (来源: {fetcher.name})")
                         return quote
                 except Exception as e:
                     logger.warning(f"[实时行情] 港股 {stock_code} 获取失败: {e}")
@@ -399,90 +223,49 @@ class DataFetcherManager:
         source_priority = config.realtime_source_priority.split(',')
         return merge_realtime_quotes(stock_code, self._fetchers, source_priority)
 
-    def _fetcher_by_name(self, name: str) -> Optional["BaseFetcher"]:
-        """按类名取 fetcher 实例；_fetchers 延迟加载，故每次现查不缓存。"""
-        for fetcher in self._fetchers:
-            if fetcher.name == name:
-                return fetcher
-        return None
-
     def _quote_from_yfinance(self, stock_code: str, label: str) -> Optional["UnifiedRealtimeQuote"]:
-        """美股/美股指数实时行情：仅 YfinanceFetcher 支持。"""
-        fetcher = self._fetcher_by_name("YfinanceFetcher")
-        if fetcher is not None:
+        """美股/美股指数实时行情：按能力声明找候选（当前仅 YfinanceFetcher 声明 (realtime, us)）。"""
+        for fetcher in supporting(self._fetchers, Need(KIND_REALTIME, stock_code, "us")):
             try:
                 quote = fetcher.get_realtime_quote(stock_code)
                 if quote is not None:
-                    logger.info(f"[实时行情] {label} {stock_code} 成功获取 (来源: yfinance)")
+                    logger.info(f"[实时行情] {label} {stock_code} 成功获取 (来源: {fetcher.name})")
                     return quote
             except Exception as e:
                 logger.warning(f"[实时行情] {label} {stock_code} 获取失败: {e}")
         logger.warning(f"[实时行情] {label} {stock_code} 无可用数据源")
         return None
 
-    # Fields worth supplementing from secondary sources when the primary
-    # source returns None for them. Ordered by importance.
-    _SUPPLEMENT_FIELDS = [
-        'volume_ratio', 'turnover_rate',
-        'pe_ratio', 'pb_ratio', 'total_mv', 'circ_mv',
-        'amplitude',
-    ]
-
-    @classmethod
-    def _quote_needs_supplement(cls, quote) -> bool:
-        """Check if any key supplementary field is still None."""
-        for f in cls._SUPPLEMENT_FIELDS:
-            if getattr(quote, f, None) is None:
-                return True
-        return False
-
-    @classmethod
-    def _merge_quote_fields(cls, primary, secondary) -> list:
-        """
-        Copy non-None fields from *secondary* into *primary* where
-        *primary* has None. Returns list of field names that were filled.
-        """
-        filled = []
-        for f in cls._SUPPLEMENT_FIELDS:
-            if getattr(primary, f, None) is None:
-                val = getattr(secondary, f, None)
-                if val is not None:
-                    setattr(primary, f, val)
-                    filled.append(f)
-        return filled
-
-
     def get_market_stats(self) -> Dict[str, Any]:
-        """获取市场涨跌统计（自动切换数据源）"""
-        for fetcher in self._fetchers:
-            try:
-                data = fetcher.get_market_stats()
-                if data:
-                    logger.info(f"[{fetcher.name}] 获取市场统计成功")
-                    return data
-            except Exception as e:
-                logger.warning(f"[{fetcher.name}] 获取市场统计失败: {e}")
-                continue
-        return {}
+        """获取市场涨跌统计（自动切换数据源）；全部源无数据返回 {}。"""
+        stats = query_first("市场统计", self._fetchers, "get_market_stats")
+        if stats is None:
+            logger.warning("[市场统计] 无可用数据源")
+            return {}
+        return stats
 
 
-    @staticmethod
-    def _has_meaningful_payload(payload: Any) -> bool:
-        if payload is None:
-            return False
-        if isinstance(payload, str):
-            normalized = payload.strip().lower()
-            return normalized not in ("", "-", "nan", "none", "null", "n/a", "na")
-        if isinstance(payload, dict):
-            return any(DataFetcherManager._has_meaningful_payload(v) for v in payload.values())
-        if isinstance(payload, (list, tuple, set)):
-            return any(DataFetcherManager._has_meaningful_payload(v) for v in payload)
-        try:
-            if pd.isna(payload):
-                return False
-        except Exception:
-            pass
-        return True
+    def get_main_fund_flow(self, stock_code: str, days: int = 5) -> Optional[pd.DataFrame]:
+        """
+        获取个股主力资金流向（自动切换数据源）。
+
+        当前仅 AkshareFetcher 声明 (fund_flow, cn)，其余源由能力筛选直接排除。
+
+        Args:
+            stock_code: 股票代码
+            days: 统计天数（默认 5 个交易日）
+
+        Returns:
+            标准化 DataFrame（列：date / main_net_inflow，单位元）；全部无数据时返回 None
+        """
+        code = normalize_stock_code(stock_code)
+        df = query_first(
+            f"主力资金流 {code}", self._fetchers, "get_main_fund_flow", code, days=days,
+            need=Need(KIND_FUND_FLOW, code, classify_market(code)),
+        )
+        if df is None:
+            logger.warning(f"[主力资金流] {stock_code} 无可用数据源，返回 None")
+        return df
 
 
 

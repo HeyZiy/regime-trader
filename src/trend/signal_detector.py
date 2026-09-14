@@ -300,7 +300,7 @@ def detect_pullback_signals(code: str, name: str, df: pd.DataFrame) -> List[Tech
 
     # 3. 选股名单条件：换手率 > 3%（保证活跃度，缩量日允许适当降低）
     #    换手率缺失（数据源未提供）时视为「未知」：跳过该子条件放行并发告警，
-    #    避免「默认0 → 永远挡掉所有信号」的静默黑屏（见 base._BACKFILL_COLUMNS）。
+    #    避免「默认0 → 永远挡掉所有信号」的静默黑屏（回补逻辑见 data_provider/daily.py: BACKFILL_COLUMNS）。
     _tr = latest.get('turnover_rate')
     turnover_unknown = _tr is None or pd.isna(_tr)
     turnover = 0.0 if turnover_unknown else float(_tr)

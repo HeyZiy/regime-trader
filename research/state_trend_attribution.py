@@ -106,8 +106,7 @@ def _load_universe(codes: List[str], fetch_start: str, end_date: str,
             continue
         df = None
         try:
-            result = fetcher.get_daily_data(code, start_str, end_str)
-            raw = result[0] if isinstance(result, tuple) else result
+            raw = fetcher.get_daily_data(code, start_str, end_str)
             if raw is not None and hasattr(raw, "empty") and not raw.empty:
                 df = raw.rename(columns={"日期": "date", "收盘": "close",
                                          "最低": "low", "成交量": "volume"})

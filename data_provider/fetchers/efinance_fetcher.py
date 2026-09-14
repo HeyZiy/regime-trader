@@ -23,7 +23,6 @@ EfinanceFetcher - 优先数据源 (Priority 0)
 import logging
 import os
 import random
-import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -100,12 +99,14 @@ def _get_session() -> requests.Session:
 
 
 from data_provider.fetchers.base import BaseFetcher
+from data_provider.stats import calc_market_stats
 from data_provider.types import (
+    KIND_REALTIME, KIND_STOCK_DAILY,
     DataFetchError, RateLimitError, STANDARD_COLUMNS,
     UnifiedRealtimeQuote, RealtimeSource,
     get_realtime_circuit_breaker, safe_float, safe_int,
 )
-from data_provider.codes import is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code
+from data_provider.codes import is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code, is_etf_code, is_us_stock_code
 
 
 # EfinanceRealtimeQuote 别名（外部统一引用 UnifiedRealtimeQuote）
@@ -180,36 +181,6 @@ _etf_realtime_cache: Dict[str, Any] = {
     'timestamp': 0,
     'ttl': 600  # 10分钟缓存有效期
 }
-
-
-def _is_etf_code(stock_code: str) -> bool:
-    """
-    判断代码是否为 ETF 基金
-    
-    ETF 代码规则：
-    - 上交所 ETF: 51xxxx, 52xxxx, 56xxxx, 58xxxx
-    - 深交所 ETF: 15xxxx, 16xxxx, 18xxxx
-    
-    Args:
-        stock_code: 股票/基金代码
-        
-    Returns:
-        True 表示是 ETF 代码，False 表示是普通股票代码
-    """
-    etf_prefixes = ('51', '52', '56', '58', '15', '16', '18')
-    return stock_code.startswith(etf_prefixes) and len(stock_code) == 6
-
-
-def _is_us_code(stock_code: str) -> bool:
-    """
-    判断代码是否为美股
-    
-    美股代码规则：
-    - 1-5个大写字母，如 'AAPL', 'TSLA'
-    - 可能包含 '.'，如 'BRK.B'
-    """
-    code = stock_code.strip().upper()
-    return bool(re.match(r'^[A-Z]{1,5}(\.[A-Z])?$', code))
 
 
 def _ef_call_with_timeout(func, *args, timeout=None, **kwargs):
@@ -304,6 +275,9 @@ class EfinanceFetcher(BaseFetcher):
     priority = int(os.getenv("EFINANCE_PRIORITY", "1"))
     # 东财 K 线含换手率列
     SUPPORTS_COLUMNS = {'date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turnover_rate'}
+
+    # 日线与实时均仅 A 股（美股明确拒绝，见 _fetch_raw_data）
+    SUPPORTS = frozenset({(KIND_STOCK_DAILY, "cn"), (KIND_REALTIME, "cn")})
     
     def __init__(self, sleep_min: float = 1.5, sleep_max: float = 3.0):
         """
@@ -435,11 +409,11 @@ class EfinanceFetcher(BaseFetcher):
         5. 处理返回数据
         """
         # 美股不支持，抛出异常让 DataFetcherManager 切换到 AkshareFetcher/YfinanceFetcher
-        if _is_us_code(stock_code):
+        if is_us_stock_code(stock_code):
             raise DataFetchError(f"EfinanceFetcher 不支持美股 {stock_code}，请使用 AkshareFetcher 或 YfinanceFetcher")
         
         # 根据代码类型选择不同的获取方法
-        if _is_etf_code(stock_code):
+        if is_etf_code(stock_code):
             return self._fetch_etf_data(stock_code, start_date, end_date)
         else:
             return self._fetch_stock_data(stock_code, start_date, end_date)
@@ -686,7 +660,7 @@ class EfinanceFetcher(BaseFetcher):
             UnifiedRealtimeQuote 对象，获取失败返回 None
         """
         # ETF 需要单独请求 ETF 实时行情接口
-        if _is_etf_code(stock_code):
+        if is_etf_code(stock_code):
             return self._get_etf_realtime_quote(stock_code)
 
         import efinance as ef
@@ -738,44 +712,43 @@ class EfinanceFetcher(BaseFetcher):
                 return None
             
             row = row.iloc[0]
-            
-            # 使用 types.py 中的统一转换函数
-            # 获取列名（可能是中文或英文）
-            name_col = '股票名称' if '股票名称' in df.columns else 'name'
-            price_col = '最新价' if '最新价' in df.columns else 'price'
-            pct_col = '涨跌幅' if '涨跌幅' in df.columns else 'pct_chg'
-            chg_col = '涨跌额' if '涨跌额' in df.columns else 'change'
-            vol_col = '成交量' if '成交量' in df.columns else 'volume'
-            amt_col = '成交额' if '成交额' in df.columns else 'amount'
-            turn_col = '换手率' if '换手率' in df.columns else 'turnover_rate'
-            amp_col = '振幅' if '振幅' in df.columns else 'amplitude'
-            high_col = '最高' if '最高' in df.columns else 'high'
-            low_col = '最低' if '最低' in df.columns else 'low'
-            open_col = '开盘' if '开盘' in df.columns else 'open'
-            # efinance 也返回量比、市盈率、市值等字段
-            vol_ratio_col = '量比' if '量比' in df.columns else 'volume_ratio'
-            pe_col = '市盈率' if '市盈率' in df.columns else 'pe_ratio'
-            total_mv_col = '总市值' if '总市值' in df.columns else 'total_mv'
-            circ_mv_col = '流通市值' if '流通市值' in df.columns else 'circ_mv'
-            
+
+            # 列名映射：中文列名 → 标准列名（efinance 可能返回中英两种）
+            _col = {
+                '股票名称': 'name', 'name': 'name',
+                '最新价': 'price', 'price': 'price',
+                '涨跌幅': 'pct_chg', 'pct_chg': 'pct_chg',
+                '涨跌额': 'change', 'change': 'change',
+                '成交量': 'volume', 'volume': 'volume',
+                '成交额': 'amount', 'amount': 'amount',
+                '换手率': 'turnover_rate', 'turnover_rate': 'turnover_rate',
+                '振幅': 'amplitude', 'amplitude': 'amplitude',
+                '最高': 'high', 'high': 'high',
+                '最低': 'low', 'low': 'low',
+                '开盘': 'open', 'open': 'open',
+                '量比': 'volume_ratio', 'volume_ratio': 'volume_ratio',
+                '市盈率': 'pe_ratio', 'pe_ratio': 'pe_ratio',
+                '总市值': 'total_mv', 'total_mv': 'total_mv',
+                '流通市值': 'circ_mv', 'circ_mv': 'circ_mv',
+            }
             quote = UnifiedRealtimeQuote(
                 code=stock_code,
-                name=str(row.get(name_col, '')),
+                name=str(row.get(_col.get('股票名称', 'name'), '')),
                 source=RealtimeSource.EFINANCE,
-                price=safe_float(row.get(price_col)),
-                change_pct=safe_float(row.get(pct_col)),
-                change_amount=safe_float(row.get(chg_col)),
-                volume=safe_int(row.get(vol_col)),
-                amount=safe_float(row.get(amt_col)),
-                turnover_rate=safe_float(row.get(turn_col)),
-                amplitude=safe_float(row.get(amp_col)),
-                high=safe_float(row.get(high_col)),
-                low=safe_float(row.get(low_col)),
-                open_price=safe_float(row.get(open_col)),
-                volume_ratio=safe_float(row.get(vol_ratio_col)),  # 量比
-                pe_ratio=safe_float(row.get(pe_col)),  # 市盈率
-                total_mv=safe_float(row.get(total_mv_col)),  # 总市值
-                circ_mv=safe_float(row.get(circ_mv_col)),  # 流通市值
+                price=safe_float(row.get(_col.get('最新价', 'price'))),
+                change_pct=safe_float(row.get(_col.get('涨跌幅', 'pct_chg'))),
+                change_amount=safe_float(row.get(_col.get('涨跌额', 'change'))),
+                volume=safe_int(row.get(_col.get('成交量', 'volume'))),
+                amount=safe_float(row.get(_col.get('成交额', 'amount'))),
+                turnover_rate=safe_float(row.get(_col.get('换手率', 'turnover_rate'))),
+                amplitude=safe_float(row.get(_col.get('振幅', 'amplitude'))),
+                high=safe_float(row.get(_col.get('最高', 'high'))),
+                low=safe_float(row.get(_col.get('最低', 'low'))),
+                open_price=safe_float(row.get(_col.get('开盘', 'open'))),
+                volume_ratio=safe_float(row.get(_col.get('量比', 'volume_ratio'))),
+                pe_ratio=safe_float(row.get(_col.get('市盈率', 'pe_ratio'))),
+                total_mv=safe_float(row.get(_col.get('总市值', 'total_mv'))),
+                circ_mv=safe_float(row.get(_col.get('流通市值', 'circ_mv'))),
             )
             
             logger.info(f"[实时行情-efinance] {stock_code} {quote.name}: 价格={quote.price}, 涨跌={quote.change_pct}%, "
@@ -847,32 +820,33 @@ class EfinanceFetcher(BaseFetcher):
                 return None
 
             row = row.iloc[0]
-            name_col = '股票名称' if '股票名称' in df.columns else 'name'
-            price_col = '最新价' if '最新价' in df.columns else 'price'
-            pct_col = '涨跌幅' if '涨跌幅' in df.columns else 'pct_chg'
-            chg_col = '涨跌额' if '涨跌额' in df.columns else 'change'
-            vol_col = '成交量' if '成交量' in df.columns else 'volume'
-            amt_col = '成交额' if '成交额' in df.columns else 'amount'
-            turn_col = '换手率' if '换手率' in df.columns else 'turnover_rate'
-            amp_col = '振幅' if '振幅' in df.columns else 'amplitude'
-            high_col = '最高' if '最高' in df.columns else 'high'
-            low_col = '最低' if '最低' in df.columns else 'low'
-            open_col = '开盘' if '开盘' in df.columns else 'open'
-
+            _col = {
+                '股票名称': 'name', 'name': 'name',
+                '最新价': 'price', 'price': 'price',
+                '涨跌幅': 'pct_chg', 'pct_chg': 'pct_chg',
+                '涨跌额': 'change', 'change': 'change',
+                '成交量': 'volume', 'volume': 'volume',
+                '成交额': 'amount', 'amount': 'amount',
+                '换手率': 'turnover_rate', 'turnover_rate': 'turnover_rate',
+                '振幅': 'amplitude', 'amplitude': 'amplitude',
+                '最高': 'high', 'high': 'high',
+                '最低': 'low', 'low': 'low',
+                '开盘': 'open', 'open': 'open',
+            }
             quote = UnifiedRealtimeQuote(
                 code=target_code,
-                name=str(row.get(name_col, '')),
+                name=str(row.get(_col.get('股票名称', 'name'), '')),
                 source=RealtimeSource.EFINANCE,
-                price=safe_float(row.get(price_col)),
-                change_pct=safe_float(row.get(pct_col)),
-                change_amount=safe_float(row.get(chg_col)),
-                volume=safe_int(row.get(vol_col)),
-                amount=safe_float(row.get(amt_col)),
-                turnover_rate=safe_float(row.get(turn_col)),
-                amplitude=safe_float(row.get(amp_col)),
-                high=safe_float(row.get(high_col)),
-                low=safe_float(row.get(low_col)),
-                open_price=safe_float(row.get(open_col)),
+                price=safe_float(row.get(_col.get('最新价', 'price'))),
+                change_pct=safe_float(row.get(_col.get('涨跌幅', 'pct_chg'))),
+                change_amount=safe_float(row.get(_col.get('涨跌额', 'change'))),
+                volume=safe_int(row.get(_col.get('成交量', 'volume'))),
+                amount=safe_float(row.get(_col.get('成交额', 'amount'))),
+                turnover_rate=safe_float(row.get(_col.get('换手率', 'turnover_rate'))),
+                amplitude=safe_float(row.get(_col.get('振幅', 'amplitude'))),
+                high=safe_float(row.get(_col.get('最高', 'high'))),
+                low=safe_float(row.get(_col.get('最低', 'low'))),
+                open_price=safe_float(row.get(_col.get('开盘', 'open'))),
             )
 
             logger.info(
@@ -911,99 +885,11 @@ class EfinanceFetcher(BaseFetcher):
                 logger.warning("[API返回] 市场统计数据为空")
                 return None
 
-            return self._calc_market_stats(df)
+            return calc_market_stats(df)
         except Exception as e:
             logger.error(f"[efinance] 获取市场统计失败: {e}")
             return None
         
-    def _calc_market_stats(
-        self,
-        df: pd.DataFrame,
-        ) -> Optional[Dict[str, Any]]:
-        """从行情 DataFrame 计算涨跌统计。"""
-        import numpy as np
-
-        df = df.copy()
-        
-        # 1. 提取基础比对数据：最新价、昨收
-        # 兼容不同接口返回的列名 sina/em efinance tushare xtdata
-        code_col = next((c for c in ['代码', '股票代码', 'ts_code','stock_code'] if c in df.columns), None)
-        name_col = next((c for c in ['名称', '股票名称','name','name'] if c in df.columns), None)
-        close_col = next((c for c in ['最新价', '最新价', 'close','lastPrice'] if c in df.columns), None)
-        pre_close_col = next((c for c in ['昨收', '昨日收盘', 'pre_close','lastClose'] if c in df.columns), None)
-        amount_col = next((c for c in ['成交额', '成交额', 'amount','amount'] if c in df.columns), None) 
-        
-        limit_up_count = 0
-        limit_down_count = 0
-        up_count = 0
-        down_count = 0
-        flat_count = 0
-
-        for code, name, current_price, pre_close, amount in zip(
-            df[code_col], df[name_col], df[close_col], df[pre_close_col], df[amount_col]
-        ):
-            
-            # 停牌过滤 efinance 的停牌数据有时候会缺失价格显示为 '-'，em 显示为none
-            if pd.isna(current_price) or pd.isna(pre_close) or current_price in ['-'] or pre_close in ['-'] or amount == 0:
-                continue
-            
-            # em、efinance 为str 需要转换为float
-            current_price = float(current_price)
-            pre_close = float(pre_close)
-            
-            # 获取去除前缀的纯数字代码
-            pure_code = normalize_stock_code(str(code)) 
-
-            # A. 确定每只股票的涨跌幅比例 (使用纯数字代码判断)
-            if is_bse_code(pure_code): 
-                ratio = 0.30
-            elif is_kc_cy_stock(pure_code): #pure_code.startswith(('688', '30')):
-                ratio = 0.20
-            elif is_st_stock(name): #'ST' in str_name:
-                ratio = 0.05
-            else:
-                ratio = 0.10
-
-            # B. 严格按照 A 股规则计算涨跌停价：昨收 * (1 ± 比例) -> 四舍五入保留2位小数
-            limit_up_price = np.floor(pre_close * (1 + ratio) * 100 + 0.5) / 100.0
-            limit_down_price = np.floor(pre_close * (1 - ratio) * 100 + 0.5) / 100.0
-
-            limit_up_price_Tolerance = round(abs(pre_close * (1 + ratio) - limit_up_price), 10)
-            limit_down_price_Tolerance = round(abs(pre_close * (1 - ratio) - limit_down_price), 10)
-
-            # C. 精确比对
-            if current_price > 0 :
-                is_limit_up = (current_price > 0) and (abs(current_price - limit_up_price) <= limit_up_price_Tolerance)
-                is_limit_down = (current_price > 0) and (abs(current_price - limit_down_price) <= limit_down_price_Tolerance)
-
-                if is_limit_up:
-                    limit_up_count += 1
-                if is_limit_down:
-                    limit_down_count += 1
-
-                if current_price > pre_close:
-                    up_count += 1
-                elif current_price < pre_close:
-                    down_count += 1
-                else:
-                    flat_count += 1
-                
-        # 统计数量
-        stats = {
-            'up_count': up_count,
-            'down_count': down_count,
-            'flat_count': flat_count,
-            'limit_up_count': limit_up_count,
-            'limit_down_count': limit_down_count,
-            'total_amount': 0.0,
-        }
-        
-        # 成交额统计
-        if amount_col and amount_col in df.columns:
-            df[amount_col] = pd.to_numeric(df[amount_col], errors='coerce')
-            stats['total_amount'] = (df[amount_col].sum() / 1e8)
-            
-        return stats
 
     def get_sector_quotes(self) -> Optional[pd.DataFrame]:
         """获取全量行业板块实时行情（东财），含板块名称/涨跌幅列。
