@@ -63,7 +63,7 @@ from src.trend.veto_rules import (
 from src.trend.signal_detector import (
     UNKNOWN_SECTOR, TechnicalSignal, detect_pullback_signals, MA20_BIAS_MAX,
 )
-from src.trend.report import generate_technical_report
+from src.trend.report import format_buy_signal_alert, generate_technical_report
 setup_env()
 
 logger = logging.getLogger(__name__)
@@ -450,9 +450,13 @@ def _save_report(report: str) -> str:
     return report_path
 
 
-def _send_notification(report: str) -> bool:
-    """发送通知，如果已配置且可用。"""
-    notifier = NotificationService()
+def _send_notification(report: str,
+                       notifier: Optional[NotificationService] = None) -> bool:
+    """发送通知，如果已配置且可用。
+
+    notifier 可复用（一次运行内先发买点提醒、再发完整日报，避免重复初始化渠道）。
+    """
+    notifier = notifier or NotificationService()
     if not notifier.is_available():
         logger.warning("通知服务未配置")
         return False
@@ -536,19 +540,27 @@ def main():
                 logger.info(f"抑制 {len(signals) - len(filtered)} 只持仓股票的买入信号")
             signals = filtered
 
+        market_env = (can_trade, market_summary, market_regime)
+        notifier = None if args.no_notify else NotificationService()
+
+        # 4.6 买点即时提醒：出现达标买点先单独推一条，不必等完整日报跑完
+        alert = format_buy_signal_alert(signals, market_env)
+        if alert and notifier:
+            logger.info("发现达标买点，先推送买点即时提醒")
+            _send_notification(alert, notifier)
+
         report = generate_technical_report(signals, skipped_stocks,
-                                           market_env=(can_trade, market_summary, market_regime),
+                                           market_env=market_env,
                                            failed_stocks=failed_stocks,
                                            vetoed_stocks=vetoed_stocks,
-                                           skip_stats=skip_stats,
                                            regime_diag=regime_diag)
 
         # 5. 保存报告
         _save_report(report)
 
         # 6. 发送通知
-        if not args.no_notify:
-            _send_notification(report)
+        if notifier:
+            _send_notification(report, notifier)
         
         logger.info("运行完成")
         return 0
