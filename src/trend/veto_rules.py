@@ -92,6 +92,70 @@ class VetoResult:
         self.reasons.append(reason)
 
 
+# ==================== 否决规则统计 ====================
+
+@dataclass
+class VetoRuleStat:
+    """单条否决规则的聚合统计。"""
+
+    rule_id: str
+    name: str
+    checked: int = 0       # 实际执行判定的股票数
+    triggered: int = 0     # 触发否决的股票数
+    skipped: int = 0       # 因数据缺失放行的股票数
+
+    def record_checked(self) -> None:
+        self.checked += 1
+
+    def record_triggered(self) -> None:
+        self.triggered += 1
+
+    def record_skipped(self) -> None:
+        self.skipped += 1
+
+    def summary(self) -> str:
+        """「检查 N 只 / 否决 N 只 / 放行 M 只」文案。"""
+        parts = [f"检查 {self.checked} 只"]
+        if self.triggered:
+            parts.append(f"否决 {self.triggered} 只")
+        if self.skipped:
+            parts.append(f"放行 {self.skipped} 只（数据缺失）")
+        return "，".join(parts)
+
+
+class VetoStats:
+    """按规则聚合负面清单检查统计。"""
+
+    # 行情类规则
+    MARKET_RULES = [
+        ("V2", "60日累计涨幅>100%"),
+        ("V3", "20日换手率均值>12%"),
+        ("V4", "20日单日跌幅>7%≥2次"),
+        ("V6", "20日涨跌停≥3天"),
+        ("V7", "距60日最低涨幅>80%"),
+        ("V9", "20日波动率标准差>5%"),
+    ]
+    # 外部数据规则
+    EXTERNAL_RULES = [
+        ("V1", "20日风险公告"),
+        ("V5", "5日主力净流出>流通市值1%"),
+    ]
+
+    def __init__(self) -> None:
+        self._stats: Dict[str, VetoRuleStat] = {}
+        for rid, rname in self.MARKET_RULES + self.EXTERNAL_RULES:
+            self._stats[rid] = VetoRuleStat(rid, rname)
+
+    def get(self, rule_id: str) -> VetoRuleStat:
+        return self._stats[rule_id]
+
+    def log_summary(self) -> None:
+        """把逐条统计写进日志。"""
+        for rid, _ in self.MARKET_RULES + self.EXTERNAL_RULES:
+            stat = self._stats[rid]
+            logger.info(f"  负面清单 {stat.rule_id} {stat.name}: {stat.summary()}")
+
+
 # ==================== 行情类规则（V2/V3/V4/V6/V7/V9）====================
 
 def _limit_move_threshold(code: str) -> float:
@@ -106,96 +170,109 @@ def _limit_move_threshold(code: str) -> float:
     return 9.5
 
 
-def check_market_veto(code: str, name: str, df: Optional[pd.DataFrame]) -> VetoResult:
+def check_market_veto(
+    code: str, name: str, df: Optional[pd.DataFrame],
+    stats: Optional[VetoStats] = None,
+) -> Tuple[VetoResult, List[str]]:
     """负面清单 — 行情类规则（V2/V3/V4/V6/V7/V9），纯本地计算，无外部 I/O。
 
     Args:
         code: 股票代码
         name: 股票名称（仅用于日志）
         df: 日线 DataFrame，需含 close / turnover_rate(可选) / date，按日期升序
+        stats: 可选统计对象
 
     Returns:
-        VetoResult；未触发时 vetoed=False
+        (VetoResult, skipped_rules) — skipped_rules 为因数据缺失未生效的规则描述列表
     """
     result = VetoResult()
+    skipped: List[str] = []
     if df is None or len(df) < 2:
-        return result
+        return result, skipped
 
     df = df.sort_values('date').reset_index(drop=True)
     n = len(df)
     tag = f"{name}({code})"
     closes = df['close'].astype(float)
-    pct = closes.pct_change() * 100  # 日涨跌幅(%)，首行为 NaN
+    pct = closes.pct_change() * 100
 
-    # --- V3 近20日换手率均值 > 12%（换手率缺失时跳过，与 skip_rules 同约定）---
-    if 'turnover_rate' in df.columns and n >= 20:
+    has_enough_bars_20 = n >= 20
+    has_enough_bars_60 = n >= BARS_FOR_60D
+    has_turnover = 'turnover_rate' in df.columns
+
+    # --- V3 近20日换手率均值 > 12% ---
+    if has_turnover and has_enough_bars_20:
+        if stats:
+            stats.get("V3").record_checked()
         tr_20 = pd.to_numeric(df['turnover_rate'].iloc[-20:], errors='coerce')
         tr_mean = tr_20.mean()
         if pd.notna(tr_mean) and tr_mean > TURNOVER_20D_MAX:
-            result.add(
-                f"V3 近20日换手均值{tr_mean:.1f}%>{TURNOVER_20D_MAX}%",
-            )
-    elif 'turnover_rate' not in df.columns:
-        logger.warning(f"  {tag}: 换手率列缺失，负面清单 V3（高换手）跳过")
+            result.add(f"V3 近20日换手均值{tr_mean:.1f}%>{TURNOVER_20D_MAX}%")
+    elif not has_turnover:
+        skipped.append("V3 换手率列缺失")
+        if stats:
+            stats.get("V3").record_skipped()
 
     # --- V4 近20日 ≥2 次单日跌幅 > 7% ---
-    if n >= 20:
+    if stats:
+        stats.get("V4").record_checked()
+    if has_enough_bars_20:
         big_drops = int((pct.iloc[-20:] <= BIG_DROP_PCT).sum())
         if big_drops >= BIG_DROP_MIN_COUNT:
-            result.add(
-                f"V4 近20日{big_drops}次单日跌幅>7%",
-            )
+            result.add(f"V4 近20日{big_drops}次单日跌幅>7%")
 
     # --- V6 近20日涨停或跌停天数 ≥ 3 ---
+    if stats:
+        stats.get("V6").record_checked()
     if n >= LIMIT_MOVE_LOOKBACK + 1:
         threshold = _limit_move_threshold(code)
         limit_days = int((pct.iloc[-LIMIT_MOVE_LOOKBACK:].abs() >= threshold).sum())
         if limit_days >= LIMIT_MOVE_DAYS:
-            result.add(
-                f"V6 近{LIMIT_MOVE_LOOKBACK}日涨跌停{limit_days}天≥{LIMIT_MOVE_DAYS}天",
-            )
+            result.add(f"V6 近{LIMIT_MOVE_LOOKBACK}日涨跌停{limit_days}天≥{LIMIT_MOVE_DAYS}天")
 
-    # --- V9 近20日日收益率标准差 > 5%（波动率过大，博弈激烈，不适合低吸）---
-    if n >= 20:
+    # --- V9 近20日日收益率标准差 > 5% ---
+    if stats:
+        stats.get("V9").record_checked()
+    if has_enough_bars_20:
         vol_std = float(pct.iloc[-20:].std())
         if pd.notna(vol_std) and vol_std > VOLATILITY_20D_MAX:
-            result.add(
-                f"V9 近20日日收益率标准差{vol_std:.1f}%>{VOLATILITY_20D_MAX}%",
-            )
+            result.add(f"V9 近20日日收益率标准差{vol_std:.1f}%>{VOLATILITY_20D_MAX}%")
 
     # --- 60 日规则：需要至少 61 个交易日 ---
-    if n < BARS_FOR_60D:
-        logger.warning(
-            f"  {tag}: 数据仅{n}条(<{BARS_FOR_60D})，60日类否决规则(V2/V7)跳过"
-        )
-        return result
+    if not has_enough_bars_60:
+        skipped.append(f"V2/V7 K线不足({n}条<{BARS_FOR_60D})")
+        if stats:
+            for rid in ("V2", "V7"):
+                stats.get(rid).record_skipped()
+        if result.vetoed:
+            logger.info(f"🚫 负面清单否决 {tag}: {'；'.join(result.reasons)} → {ACTION_LABELS[result.action]}")
+        return result, skipped
 
     window = closes.iloc[-60:]
     last_close = float(closes.iloc[-1])
     low_60 = float(window.min())
 
     # --- V2 近60日累计涨幅 > 100% ---
+    if stats:
+        stats.get("V2").record_checked()
     base_close = float(closes.iloc[-BARS_FOR_60D])
     if base_close > 0:
         gain_60d = (last_close - base_close) / base_close * 100
         if gain_60d > GAIN_60D_MAX:
-            result.add(
-                f"V2 近60日累计涨幅{gain_60d:.1f}%>{GAIN_60D_MAX}%",
-            )
+            result.add(f"V2 近60日累计涨幅{gain_60d:.1f}%>{GAIN_60D_MAX}%")
 
     # --- V7 距近60日最低收盘价的涨幅 > 80% ---
+    if stats:
+        stats.get("V7").record_checked()
     if low_60 > 0:
         from_low = (last_close - low_60) / low_60 * 100
         if from_low > FROM_60D_LOW_MAX:
-            result.add(
-                f"V7 距60日最低收盘涨幅{from_low:.1f}%>{FROM_60D_LOW_MAX}%",
-            )
-
+            result.add(f"V7 距60日最低收盘涨幅{from_low:.1f}%>{FROM_60D_LOW_MAX}%")
 
     if result.vetoed:
         logger.info(f"🚫 负面清单否决 {tag}: {'；'.join(result.reasons)} → {ACTION_LABELS[result.action]}")
 
-    return result
+    return result, skipped
 
 
 # ==================== 外部数据规则（V1 公告 / V5 主力资金）====================
@@ -266,10 +343,14 @@ def _extract_news_items(resp: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
     return items
 
 
-def _check_announcement_veto(code: str, name: str, mx_service: Any) -> Optional[str]:
-    """V1：近 20 日发布过异常波动 / 风险提示公告 → 返回触发原因，否则 None。"""
+def _check_announcement_veto(
+    code: str, name: str, mx_service: Any,
+    stats: Optional[VetoStats] = None,
+) -> Tuple[Optional[str], List[str]]:
+    """V1：近 20 日发布过异常波动 / 风险提示公告 → (触发原因, skipped_rules)。"""
+    skipped: List[str] = []
     if mx_service is None:
-        return None
+        return None, skipped
 
     try:
         resp = mx_service.search_news(
@@ -277,12 +358,14 @@ def _check_announcement_veto(code: str, name: str, mx_service: Any) -> Optional[
         )
         items = _extract_news_items(resp)
     except Exception as e:
-        logger.warning(f"  {name}({code}): V1 公告检索失败，放行（{e}）")
-        return None
+        if stats:
+            stats.get("V1").record_skipped()
+        return None, skipped
 
     if not items:
-        logger.debug(f"  {name}({code}): V1 未检索到公告条目")
-        return None
+        if stats:
+            stats.get("V1").record_checked()
+        return None, skipped
 
     cutoff = datetime.now() - timedelta(days=ANNOUNCEMENT_LOOKBACK_DAYS)
     for item in items:
@@ -290,60 +373,73 @@ def _check_announcement_veto(code: str, name: str, mx_service: Any) -> Optional[
         if not any(kw in title for kw in ANNOUNCEMENT_KEYWORDS):
             continue
         published = _parse_datetime(item.get("date", ""))
-        # 日期无法解析时按"较新"处理（保守方向：宁可错杀）
         if published is None or published >= cutoff:
-            return f"V1 近{ANNOUNCEMENT_LOOKBACK_DAYS}日风险公告《{title[:24]}》"
-    return None
+            if stats:
+                stats.get("V1").record_triggered()
+            return f"V1 近{ANNOUNCEMENT_LOOKBACK_DAYS}日风险公告《{title[:24]}》", skipped
+
+    if stats:
+        stats.get("V1").record_checked()
+    return None, skipped
 
 
-def _check_fund_flow_veto(code: str, name: str, fetcher: Any) -> Optional[str]:
-    """V5：近 5 日主力资金净流出 > 流通市值 1% → 返回触发原因，否则 None。
-
-    Args:
-        fetcher: DataFetcherManager 实例，用于获取主力资金流和流通市值
-    """
+def _check_fund_flow_veto(
+    code: str, name: str, fetcher: Any,
+    stats: Optional[VetoStats] = None,
+) -> Tuple[Optional[str], List[str]]:
+    """V5：近 5 日主力资金净流出 > 流通市值 1% → (触发原因, skipped_rules)。"""
+    skipped: List[str] = []
     if fetcher is None:
-        return None
+        return None, skipped
 
     tag = f"{name}({code})"
 
-    # 使用 fetcher 获取主力资金流（结构化的 akshare/efinance）
     try:
         df = fetcher.get_main_fund_flow(code, days=FUND_FLOW_DAYS)
         net_flow = df['main_net_inflow'].sum() if df is not None and not df.empty and 'main_net_inflow' in df.columns else None
     except Exception as e:
-        logger.warning(f"  {tag}: V5 fetcher 主力资金获取失败（{e}）")
-        net_flow = None
+        if stats:
+            stats.get("V5").record_skipped()
+        return None, skipped
 
     if net_flow is None:
-        logger.warning(f"  {tag}: V5 主力资金数据缺失，放行")
-        return None
+        skipped.append("V5 主力资金数据缺失")
+        if stats:
+            stats.get("V5").record_skipped()
+        return None, skipped
     if net_flow >= 0:
-        return None
+        if stats:
+            stats.get("V5").record_checked()
+        return None, skipped
 
-    # 获取流通市值
     try:
         quote = fetcher.get_realtime_quote(code)
     except Exception as e:
-        logger.warning(f"  {tag}: V5 流通市值获取失败，放行（{e}）")
-        return None
+        if stats:
+            stats.get("V5").record_skipped()
+        return None, skipped
 
     circ_mv = getattr(quote, "circ_mv", None) if quote is not None else None
     if not circ_mv or circ_mv <= 0:
-        logger.warning(f"  {tag}: V5 流通市值缺失，放行")
-        return None
+        skipped.append("V5 流通市值缺失")
+        if stats:
+            stats.get("V5").record_skipped()
+        return None, skipped
 
-    # 净流出占比（主力净额与 circ_mv 同为元）
     outflow = abs(net_flow)
     ratio = outflow / circ_mv * 100
 
     if ratio > FUND_FLOW_OUTFLOW_PCT:
+        if stats:
+            stats.get("V5").record_triggered()
         return (
             f"V5 近{FUND_FLOW_DAYS}日主力净流出{outflow / 1e8:.2f}亿，"
             f"占流通市值{ratio:.2f}%>{FUND_FLOW_OUTFLOW_PCT}%"
-        )
+        ), skipped
 
-    return None
+    if stats:
+        stats.get("V5").record_checked()
+    return None, skipped
 
 
 def check_external_veto(
@@ -351,32 +447,37 @@ def check_external_veto(
     name: str,
     mx_service: Any = None,
     fetcher: Any = None,
-) -> VetoResult:
+    stats: Optional[VetoStats] = None,
+) -> Tuple[VetoResult, List[str]]:
     """负面清单 — 外部数据规则（V1 公告 / V5 主力资金）。
 
     依赖妙想 API 且有日调用限额，只对已产出信号的候选惰性调用。
-    数据缺失或解析失败一律 fail-open（放行）并记 warning。
+    数据缺失或解析失败一律 fail-open（放行）。
 
     Args:
         code: 股票代码
         name: 股票名称
-        mx_service: MXService 实例（V1 公告规则仍使用，V5 主力资金已迁移到 fetcher）
-        fetcher: DataFetcherManager 实例，用于获取主力资金流和流通市值
+        mx_service: MXService 实例
+        fetcher: DataFetcherManager 实例
+        stats: 可选统计对象
 
     Returns:
-        VetoResult；外部规则动作均为 skip（暂时性风险，仅跳过当日信号）
+        (VetoResult, skipped_rules) — skipped_rules 为因数据缺失未生效的规则描述列表
     """
     result = VetoResult()
+    skipped: List[str] = []
 
-    reason = _check_announcement_veto(code, name, mx_service)
+    reason, s1 = _check_announcement_veto(code, name, mx_service, stats)
+    skipped.extend(s1)
     if reason:
         result.add(reason)
 
-    reason = _check_fund_flow_veto(code, name, fetcher)
+    reason, s2 = _check_fund_flow_veto(code, name, fetcher, stats)
+    skipped.extend(s2)
     if reason:
         result.add(reason)
 
     if result.vetoed:
         logger.info(f"🚫 负面清单否决 {name}({code}): {'；'.join(result.reasons)} → {ACTION_LABELS[result.action]}")
 
-    return result
+    return result, skipped

@@ -7,7 +7,7 @@
 纯函数，不碰网络。集中存放项目所有代码判定规则：
 - normalize_stock_code / canonical_stock_code：代码归一化
 - classify_market：市场归类 cn/hk/us（编排层按此匹配数据源能力声明）
-- is_bse_code / is_st_stock / is_kc_cy_stock / _is_hk_market / is_etf_code：市场/类型判定
+- is_bse_code / is_st_stock / is_kc_cy_stock / is_hk_market / is_etf_code：市场/类型判定
 - ETF_PREFIXES：ETF 码族常量
 - _split_prefix：sh/sz/bj 前缀拆分
 
@@ -45,17 +45,10 @@ def normalize_stock_code(stock_code: str) -> str:
         if candidate.isdigit() and 1 <= len(candidate) <= 5:
             return f"HK{candidate.zfill(5)}"
 
-    # Strip SH/SZ prefix (e.g. SH600519 -> 600519)
-    if upper.startswith(('SH', 'SZ')) and not upper.startswith('SH.') and not upper.startswith('SZ.'):
+    # Strip SH/SZ/BJ prefix (e.g. SH600519 -> 600519, BJ920748 -> 920748)
+    if upper.startswith(('SH', 'SZ', 'BJ')) and not upper.startswith(('SH.', 'SZ.', 'BJ.')):
         candidate = code[2:]
-        # Only strip if the remainder looks like a valid numeric code
         if candidate.isdigit() and len(candidate) in (5, 6):
-            return candidate
-
-    # Strip BJ prefix (e.g. BJ920748 -> 920748)
-    if upper.startswith('BJ') and not upper.startswith('BJ.'):
-        candidate = code[2:]
-        if candidate.isdigit() and len(candidate) == 6:
             return candidate
 
     # Strip .SH/.SZ/.BJ suffix (e.g. 600519.SH -> 600519, 920748.BJ -> 920748)
@@ -63,7 +56,7 @@ def normalize_stock_code(stock_code: str) -> str:
         base, suffix = code.rsplit('.', 1)
         if suffix.upper() == 'HK' and base.isdigit() and 1 <= len(base) <= 5:
             return f"HK{base.zfill(5)}"
-        if suffix.upper() in ('SH', 'SZ', 'SS', 'BJ') and base.isdigit():
+        if suffix.upper() in ('SH', 'SZ', 'BJ') and base.isdigit():
             return base
 
     return code
@@ -73,7 +66,7 @@ ETF_PREFIXES = ("51", "52", "56", "58", "15", "16", "18")
 
 
 
-def _is_hk_market(code: str) -> bool:
+def is_hk_market(code: str) -> bool:
     """
     判定是否为港股代码。
 
@@ -95,10 +88,10 @@ def _is_hk_market(code: str) -> bool:
 def classify_market(code: str) -> str:
     """把代码归到 cn / hk / us 三类市场，供编排层做数据源能力匹配。
 
-    判定口径与 DataFetcherManager 的路由一致：港股走 _is_hk_market，
+    判定口径与 DataFetcherManager 的路由一致：港股走 is_hk_market，
     美股（含美股指数）走 us_index_mapping，其余归 A 股（含 ETF/北交所）。
     """
-    if _is_hk_market(code):
+    if is_hk_market(code):
         return "hk"
     from .us_index_mapping import is_us_index_code, is_us_stock_code
     if is_us_index_code(code) or is_us_stock_code(code):

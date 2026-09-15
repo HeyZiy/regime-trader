@@ -36,7 +36,7 @@ from data_provider.types import (
     KIND_REALTIME, KIND_STOCK_DAILY,
     DataFetchError, RateLimitError, STANDARD_COLUMNS, UnifiedRealtimeQuote,
 )
-from data_provider.codes import is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code, is_etf_code, _is_hk_market
+from data_provider.codes import is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code, is_etf_code, is_hk_market
 from data_provider.codes import is_us_stock_code
 from src.config import get_config
 import os
@@ -239,42 +239,45 @@ class TushareFetcher(BaseFetcher):
     def _convert_stock_code(self, stock_code: str) -> str:
         """
         转换股票代码为 Tushare 格式
-        
+
         Tushare 要求的格式：
         - 沪市股票：600519.SH
         - 深市股票：000001.SZ
         - 沪市 ETF：510050.SH, 563230.SH
         - 深市 ETF：159919.SZ
-        
+        - 北交所：920748.BJ
+
         Args:
             stock_code: 原始代码，如 '600519', '000001', '563230'
-            
+
         Returns:
             Tushare 格式代码，如 '600519.SH', '000001.SZ', '563230.SH'
         """
         code = stock_code.strip()
-        
-        # Already has suffix
+
+        # 已有后缀：补齐 BJ（SH/SZ 已含 6 位数字可直接返回）
         if '.' in code:
-            return code.upper()
+            base, suffix = code.rsplit('.', 1)
+            if suffix.upper() in ('SH', 'SZ') and base.isdigit() and len(base) == 6:
+                return code.upper()
+            if suffix.upper() == 'BJ':
+                return f"{base}.BJ"
 
-        # HK stocks are not supported by Tushare
-        if _is_hk_market(code):
-            raise DataFetchError(f"TushareFetcher 不支持港股 {code}，请使用 AkshareFetcher")
+        # Tushare 不支持港股/美股，抛出异常由管理器切换数据源
+        if is_hk_market(code) or is_us_stock_code(code):
+            raise DataFetchError(f"TushareFetcher 不支持 {code}，请使用其他数据源")
 
-        # ETF: determine exchange by prefix
+        # ETF: 根据前缀判断交易所
         if code.startswith(_ETF_SH_PREFIXES) and len(code) == 6:
             return f"{code}.SH"
         if code.startswith(_ETF_SZ_PREFIXES) and len(code) == 6:
             return f"{code}.SZ"
-        
-        # BSE (Beijing Stock Exchange): 8xxxxx, 4xxxxx, 920xxx
+
+        # 北交所 (BJ): 8xxxxx, 4xxxxx, 920xxx
         if is_bse_code(code):
             return f"{code}.BJ"
-        
-        # Regular stocks
-        # Shanghai: 600xxx, 601xxx, 603xxx, 688xxx (STAR Market)
-        # Shenzhen: 000xxx, 001xxx, 002xxx, 003xxx (主板), 300xxx (ChiNext)
+
+        # 普通 A 股
         if code.startswith(('600', '601', '603', '688')):
             return f"{code}.SH"
         elif code.startswith(('000', '001', '002', '003', '300')):
@@ -306,19 +309,11 @@ class TushareFetcher(BaseFetcher):
         """
         if self._api is None:
             raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
-        
-        # US stocks not supported
-        if is_us_stock_code(stock_code):
-            raise DataFetchError(f"TushareFetcher 不支持美股 {stock_code}，请使用 AkshareFetcher 或 YfinanceFetcher")
 
-        # HK stocks not supported
-        if _is_hk_market(stock_code):
-            raise DataFetchError(f"TushareFetcher 不支持港股 {stock_code}，请使用 AkshareFetcher")
-        
         # Rate-limit check
         self._check_rate_limit()
-        
-        # Convert code format
+
+        # Convert code format (also validates unsupported markets)
         ts_code = self._convert_stock_code(stock_code)
         
         # Convert date format (Tushare requires YYYYMMDD)
@@ -417,16 +412,16 @@ class TushareFetcher(BaseFetcher):
             return None
 
         # HK stocks not supported by Tushare stock_basic
-        if _is_hk_market(stock_code):
+        if is_hk_market(stock_code):
             return None
 
         # 检查缓存
-        if hasattr(self, '_stock_name_cache') and stock_code in self._stock_name_cache:
-            return self._stock_name_cache[stock_code]
-        
+        cache = getattr(self, '_stock_name_cache', None)
+        if cache is not None and stock_code in cache:
+            return cache[stock_code]
+
         # 初始化缓存
-        if not hasattr(self, '_stock_name_cache'):
-            self._stock_name_cache = {}
+        self._stock_name_cache = {}
         
         try:
             # 速率限制检查
@@ -487,8 +482,7 @@ class TushareFetcher(BaseFetcher):
                 df['code'] = df['ts_code'].apply(lambda x: x.split('.')[0])
                 
                 # 更新缓存
-                if not hasattr(self, '_stock_name_cache'):
-                    self._stock_name_cache = {}
+                self._stock_name_cache = getattr(self, '_stock_name_cache', {})
                 for _, row in df.iterrows():
                     self._stock_name_cache[row['code']] = row['name']
                 
@@ -518,7 +512,7 @@ class TushareFetcher(BaseFetcher):
             return None
 
         # HK stocks not supported by Tushare
-        if _is_hk_market(stock_code):
+        if is_hk_market(stock_code):
             logger.debug(f"TushareFetcher 跳过港股实时行情 {stock_code}")
             return None
 

@@ -19,7 +19,7 @@ from typing import Optional, List, Dict, Any
 import pandas as pd
 
 from data_provider.fetchers.base import BaseFetcher
-from .codes import normalize_stock_code, classify_market, _is_hk_market
+from .codes import normalize_stock_code, classify_market, is_hk_market
 from .daily import fetch_stock_daily
 from .routing import query_first, supporting
 from .types import KIND_FUND_FLOW, KIND_REALTIME, KIND_STOCK_DAILY, Need
@@ -206,7 +206,7 @@ class DataFetcherManager:
         # 港股实时行情只走港股专用入口，避免按 A 股 source_priority
         # 反复触发同一个 ak.stock_hk_spot_em() 接口。
         # source="hk" 是 akshare 的港股入口；当前仅 AkshareFetcher 声明 (realtime, hk)
-        if _is_hk_market(stock_code):
+        if is_hk_market(stock_code):
             for fetcher in supporting(self._fetchers, Need(KIND_REALTIME, stock_code, "hk")):
                 try:
                     quote = fetcher.get_realtime_quote(stock_code, source="hk")
@@ -263,8 +263,6 @@ class DataFetcherManager:
             f"主力资金流 {code}", self._fetchers, "get_main_fund_flow", code, days=days,
             need=Need(KIND_FUND_FLOW, code, classify_market(code)),
         )
-        if df is None:
-            logger.warning(f"[主力资金流] {stock_code} 无可用数据源，返回 None")
         return df
 
 

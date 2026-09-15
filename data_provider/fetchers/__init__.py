@@ -14,7 +14,7 @@ BaseFetcher 抽象基类 + 各数据源实现。
 """
 
 from .base import BaseFetcher
-from .akshare_fetcher import AkshareFetcher, is_hk_stock_code
+from .akshare_fetcher import AkshareFetcher
 from .efinance_fetcher import EfinanceFetcher
 from .tushare_fetcher import TushareFetcher
 from .baostock_fetcher import BaostockFetcher
@@ -24,7 +24,6 @@ from .amazingdata_fetcher import AmazingDataFetcher, tgw_configured
 __all__ = [
     "BaseFetcher",
     "AkshareFetcher",
-    "is_hk_stock_code",
     "EfinanceFetcher",
     "TushareFetcher",
     "BaostockFetcher",

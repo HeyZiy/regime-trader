@@ -9,7 +9,7 @@
 """
 
 import logging
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, field
 from typing import List
 
 import pandas as pd
@@ -67,6 +67,7 @@ class TechnicalSignal:
 
     # ── 可选（有默认值）──
     sector: str = UNKNOWN_SECTOR  # 所属板块名称
+    veto_skipped: List[str] = field(default_factory=list)  # 因数据缺失未生效的否决规则
 
     def __post_init__(self) -> None:
         """构造即校验：禁止 None、校验取值域，把错误挡在渲染层之前。"""

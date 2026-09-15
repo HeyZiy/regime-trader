@@ -57,13 +57,13 @@ from src.trend.skip_rules import (
     SkipStats, check_skip_rules_detail,
 )
 from src.trend.veto_rules import (
-    check_external_veto, check_market_veto,
+    check_external_veto, check_market_veto, VetoStats,
     FROM_60D_LOW_MAX, TURNOVER_DAY_MAX,
 )
 from src.trend.signal_detector import (
     UNKNOWN_SECTOR, TechnicalSignal, detect_pullback_signals, MA20_BIAS_MAX,
 )
-from src.trend.report import format_buy_signal_alert, generate_technical_report
+from src.trend.report import format_buy_signal_alert, generate_technical_report, QUALIFY_SCORE
 setup_env()
 
 logger = logging.getLogger(__name__)
@@ -219,9 +219,11 @@ class SimpleTechnicalAnalyzer:
             logger.warning(f"妙想选股失败: {e}")
             return []
 
-    def analyze_all_stocks(self, stock_list: List[Tuple[str, str]], 
+    def analyze_all_stocks(self, stock_list: List[Tuple[str, str]],
                           max_stocks: Optional[int] = None,
-                          sort_by_pct: bool = True
+                          sort_by_pct: bool = True,
+                          market_env: Optional[Tuple] = None,
+                          notifier: Any = None,
                           ) -> Tuple[List[TechnicalSignal],
                                      List[Tuple[str, str, str]],
                                      List[Tuple[str, str, str]],
@@ -251,6 +253,7 @@ class SimpleTechnicalAnalyzer:
         failed_stocks = []
         vetoed_stocks = []
         stats = SkipStats()
+        veto_stats = VetoStats()
 
         if max_stocks and len(stock_list) > max_stocks:
             if sort_by_pct:
@@ -287,7 +290,7 @@ class SimpleTechnicalAnalyzer:
                     continue
 
                 # 负面清单（行情类）：任一规则触发即否决，不进信号池、不看评分
-                market_veto = check_market_veto(code, name, df)
+                market_veto, market_skipped = check_market_veto(code, name, df, veto_stats)
                 if market_veto.vetoed:
                     vetoed_stocks.append(
                         (code, name, market_veto.action, '；'.join(market_veto.reasons))
@@ -298,7 +301,7 @@ class SimpleTechnicalAnalyzer:
 
                 if signals:
                     # 负面清单（外部数据类）：只对已产出信号的候选惰性调用妙想 API
-                    ext_veto = check_external_veto(code, name, self.mx_service, self.fetcher)
+                    ext_veto, ext_skipped = check_external_veto(code, name, self.mx_service, self.fetcher, veto_stats)
                     if ext_veto.vetoed:
                         vetoed_stocks.append(
                             (code, name, ext_veto.action, '；'.join(ext_veto.reasons))
@@ -306,9 +309,21 @@ class SimpleTechnicalAnalyzer:
                         continue
 
                     sector = self._fetch_stock_sector(code)
+                    # 合并行情类 + 外部类未生效规则，挂到每个信号上供报告标注
+                    veto_skipped = market_skipped + ext_skipped
                     for s in signals:
                         s.sector = sector
+                        if veto_skipped:
+                            s.veto_skipped = veto_skipped
                     logger.info(f"✅ {name}({code}) [{sector}]: 发现 {len(signals)} 个信号")
+
+                    # 即时推送：每只股票一旦检出达标买点立即发一条
+                    if notifier and market_env:
+                        for s in signals:
+                            if s.signal_type in ("pullback_ma5", "pullback_ma10") and s.score >= QUALIFY_SCORE:
+                                alert = format_buy_signal_alert([s], market_env)
+                                if alert:
+                                    _send_notification(alert, notifier)
                 else:
                     logger.info(f"    {name}({code}) 无信号")
                 all_signals.extend(signals)
@@ -331,6 +346,8 @@ class SimpleTechnicalAnalyzer:
         )
         # 逐条输出跳过规则的检查/触发统计（让"跳过 N 只"可解释、未实现项可见）
         stats.log_summary()
+        # 逐条输出负面清单规则的检查/否决/放行统计
+        veto_stats.log_summary()
         return all_signals, skipped_stocks, failed_stocks, vetoed_stocks, stats
 
 
@@ -513,16 +530,7 @@ def main():
         if not stock_codes:
             logger.error("没有获取到股票列表，退出")
             return 1
-        
-        # 2. 技术分析（包含跳过检查）
-        stock_list = list(zip(stock_codes, [name_mapping.get(c, c) for c in stock_codes]))
-        logger.info(f"待分析列表: {len(stock_list)} 只股票")
 
-        signals, skipped_stocks, failed_stocks, vetoed_stocks, skip_stats = analyzer.analyze_all_stocks(
-            stock_list, max_stocks=max_stocks, sort_by_pct=False
-        )
-
-        
         # 4. 市场环境判定（指数取数 → 纯结构判定）
         index_df = fetch_index_df()
         can_trade, market_summary, market_regime = check_market_gate(index_df)
@@ -530,6 +538,18 @@ def main():
         # 诊断明细（均线排列 / 偏离 MA20 / 命中路径）供报告展示
         regime_diag = diagnose_regime(index_df)
         logger.info(f"市场状态判定明细 → {regime_diag.describe()}")
+
+        market_env = (can_trade, market_summary, market_regime)
+        notifier = None if args.no_notify else NotificationService()
+
+        # 2. 技术分析（包含跳过检查）
+        stock_list = list(zip(stock_codes, [name_mapping.get(c, c) for c in stock_codes]))
+        logger.info(f"待分析列表: {len(stock_list)} 只股票")
+
+        signals, skipped_stocks, failed_stocks, vetoed_stocks, skip_stats = analyzer.analyze_all_stocks(
+            stock_list, max_stocks=max_stocks, sort_by_pct=False,
+            market_env=market_env, notifier=notifier,
+        )
 
 
         # 4.5 已持仓股票抑制买入信号（避免"持有又提示买入"）
@@ -540,16 +560,13 @@ def main():
                 logger.info(f"抑制 {len(signals) - len(filtered)} 只持仓股票的买入信号")
             signals = filtered
 
-        market_env = (can_trade, market_summary, market_regime)
-        notifier = None if args.no_notify else NotificationService()
+        # 汇总提醒（最后一条）：汇总今日发现的所有信号
+        summary_alert = format_buy_signal_alert(signals, market_env)
+        if summary_alert and notifier:
+            logger.info("推送今日信号汇总")
+            _send_notification(summary_alert, notifier)
 
-        # 4.6 买点即时提醒：出现达标买点先单独推一条，不必等完整日报跑完
-        alert = format_buy_signal_alert(signals, market_env)
-        if alert and notifier:
-            logger.info("发现达标买点，先推送买点即时提醒")
-            _send_notification(alert, notifier)
-
-        report = generate_technical_report(signals, skipped_stocks,
+        report = generate_technical_report(all_signals, skipped_stocks,
                                            market_env=market_env,
                                            failed_stocks=failed_stocks,
                                            vetoed_stocks=vetoed_stocks,

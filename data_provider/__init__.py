@@ -53,7 +53,7 @@ from .types import (
 from .bars import get_etf_daily, get_index_daily
 from .realtime import merge_realtime_quotes
 from data_provider.fetchers.efinance_fetcher import EfinanceFetcher
-from data_provider.fetchers.akshare_fetcher import AkshareFetcher, is_hk_stock_code
+from data_provider.fetchers.akshare_fetcher import AkshareFetcher
 from data_provider.fetchers.tushare_fetcher import TushareFetcher
 from data_provider.fetchers.baostock_fetcher import BaostockFetcher
 from data_provider.fetchers.yfinance_fetcher import YfinanceFetcher
@@ -83,7 +83,6 @@ __all__ = [
     'merge_realtime_quotes',
     'EfinanceFetcher',
     'AkshareFetcher',
-    'is_hk_stock_code',
     'TushareFetcher',
     'BaostockFetcher',
     'YfinanceFetcher',

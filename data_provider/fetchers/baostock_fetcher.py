@@ -29,7 +29,7 @@ from tenacity import (
 
 from data_provider.fetchers.base import BaseFetcher
 from data_provider.types import KIND_STOCK_DAILY, DataFetchError, STANDARD_COLUMNS
-from data_provider.codes import is_bse_code, _is_hk_market, is_us_stock_code
+from data_provider.codes import is_bse_code, is_hk_market, is_us_stock_code
 import os
 
 logger = logging.getLogger(__name__)
@@ -118,30 +118,32 @@ class BaostockFetcher(BaseFetcher):
     def _convert_stock_code(self, stock_code: str) -> str:
         """
         转换股票代码为 Baostock 格式
-        
+
         Baostock 要求的格式：
         - 沪市：sh.600519
         - 深市：sz.000001
-        
+
         Args:
             stock_code: 原始代码，如 '600519', '000001'
-            
+
         Returns:
             Baostock 格式代码，如 'sh.600519', 'sz.000001'
         """
         code = stock_code.strip()
 
-        # HK stocks are not supported by Baostock
-        if _is_hk_market(code):
-            raise DataFetchError(f"BaostockFetcher 不支持港股 {code}，请使用 AkshareFetcher")
+        # Baostock 不支持港股/美股/北交所，抛出异常让 DataFetcherManager 切换数据源
+        if is_hk_market(code) or is_us_stock_code(code) or is_bse_code(code):
+            raise DataFetchError(
+                f"BaostockFetcher 不支持 {code}（仅支持 A 股），请使用其他数据源"
+            )
 
-        # 已经包含前缀的情况
+        # 已包含 sh./sz. 前缀的情况
         if code.startswith(('sh.', 'sz.')):
             return code.lower()
-        
+
         # 去除可能的后缀
         code = code.replace('.SH', '').replace('.SZ', '').replace('.sh', '').replace('.sz', '')
-        
+
         # ETF: Shanghai ETF (51xx, 52xx, 56xx, 58xx) -> sh; Shenzhen ETF (15xx, 16xx, 18xx) -> sz
         if len(code) == 6:
             if code.startswith(('51', '52', '56', '58')):
@@ -177,21 +179,7 @@ class BaostockFetcher(BaseFetcher):
         4. 调用 API 查询数据
         5. 将结果转换为 DataFrame
         """
-        # 美股不支持，抛出异常让 DataFetcherManager 切换到其他数据源
-        if is_us_stock_code(stock_code):
-            raise DataFetchError(f"BaostockFetcher 不支持美股 {stock_code}，请使用 AkshareFetcher 或 YfinanceFetcher")
-
-        # 港股不支持，抛出异常让 DataFetcherManager 切换到其他数据源
-        if _is_hk_market(stock_code):
-            raise DataFetchError(f"BaostockFetcher 不支持港股 {stock_code}，请使用 AkshareFetcher")
-
-        # 北交所不支持，抛出异常让 DataFetcherManager 切换到其他数据源
-        if is_bse_code(stock_code):
-            raise DataFetchError(
-                f"BaostockFetcher 不支持北交所 {stock_code}，将自动切换其他数据源"
-            )
-        
-        # 转换代码格式
+        # 转换代码格式（同时处理不支持的市场类型）
         bs_code = self._convert_stock_code(stock_code)
         
         logger.debug(f"调用 Baostock query_history_k_data_plus({bs_code}, {start_date}, {end_date})")
@@ -278,12 +266,12 @@ class BaostockFetcher(BaseFetcher):
             股票名称，失败返回 None
         """
         # 检查缓存
-        if hasattr(self, '_stock_name_cache') and stock_code in self._stock_name_cache:
-            return self._stock_name_cache[stock_code]
-        
+        cache = getattr(self, '_stock_name_cache', None)
+        if cache is not None and stock_code in cache:
+            return cache[stock_code]
+
         # 初始化缓存
-        if not hasattr(self, '_stock_name_cache'):
-            self._stock_name_cache = {}
+        self._stock_name_cache = {}
         
         try:
             bs_code = self._convert_stock_code(stock_code)
@@ -339,8 +327,7 @@ class BaostockFetcher(BaseFetcher):
                         df = df.rename(columns={'code_name': 'name'})
                         
                         # 更新缓存
-                        if not hasattr(self, '_stock_name_cache'):
-                            self._stock_name_cache = {}
+                        self._stock_name_cache = getattr(self, '_stock_name_cache', {})
                         for _, row in df.iterrows():
                             self._stock_name_cache[row['code']] = row['name']
                         

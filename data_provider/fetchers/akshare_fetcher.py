@@ -23,12 +23,13 @@ AkshareFetcher - 主数据源 (Priority 1)
 - 筹码分布：获利比例、平均成本、筹码集中度
 """
 
-import time
-
 import logging
 import os
-import pandas as pd
 import random
+import time
+from typing import Optional, Dict, Any, Tuple
+
+import pandas as pd
 import requests
 from tenacity import (
     retry,
@@ -37,7 +38,9 @@ from tenacity import (
     retry_if_exception_type,
     before_sleep_log,
 )
-from typing import Optional, Dict, Any, Tuple
+
+from data_provider.codes import is_bse_code, is_etf_code
+from data_provider.codes import is_hk_market
 from data_provider.fetchers.base import BaseFetcher
 from data_provider.stats import calc_market_stats
 from data_provider.types import (
@@ -46,17 +49,10 @@ from data_provider.types import (
     UnifiedRealtimeQuote, RealtimeSource,
     get_realtime_circuit_breaker, safe_float, safe_int,
 )
-from data_provider.codes import is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code, is_etf_code
-from data_provider.codes import _is_hk_market
 from data_provider.us_index_mapping import is_us_stock_code
 
 # RealtimeQuote 别名，统一实时报价类型引用
 RealtimeQuote = UnifiedRealtimeQuote
-
-
-def is_hk_stock_code(stock_code: str) -> bool:
-    """Public API: determine if a stock code is a Hong Kong stock."""
-    return _is_hk_market(stock_code)
 
 
 logger = logging.getLogger(__name__)
@@ -272,7 +268,7 @@ class AkshareFetcher(BaseFetcher):
             raise DataFetchError(
                 f"AkshareFetcher 不支持美股 {stock_code}，请使用 YfinanceFetcher 获取正确的复权价格"
             )
-        elif _is_hk_code(stock_code):
+        elif is_hk_market(stock_code):
             return self._fetch_hk_data(stock_code, start_date, end_date)
         elif is_etf_code(stock_code):
             return self._fetch_etf_data(stock_code, start_date, end_date)
@@ -288,11 +284,11 @@ class AkshareFetcher(BaseFetcher):
         2. 失败后尝试新浪财经接口 (ak.stock_zh_a_daily)
         3. 最后尝试腾讯财经接口 (ak.stock_zh_a_hist_tx)
         """
-        # 尝试列表
+        # 尝试列表：东财（默认）> 新浪 > 腾讯
         methods = [
+            (self._fetch_stock_data_em, "东方财富"),
             (self._fetch_stock_data_sina, "新浪财经"),
             (self._fetch_stock_data_tx, "腾讯财经"),
-            (self._fetch_stock_data_em, "东方财富"),
         ]
 
         last_error = None
@@ -367,44 +363,40 @@ class AkshareFetcher(BaseFetcher):
 
         self._enforce_rate_limit()
 
-        try:
-            df = ak.stock_zh_a_daily(
+        df = ak.stock_zh_a_daily(
                 symbol=symbol,
                 start_date=start_date.replace('-', ''),
                 end_date=end_date.replace('-', ''),
                 adjust="qfq"
             )
 
-            # 标准化新浪数据列名
-            # 新浪返回：date, open, high, low, close, volume, amount, outstanding_share, turnover
-            if df is not None and not df.empty:
-                # 确保日期列存在
-                if 'date' in df.columns:
-                    df = df.rename(columns={'date': '日期'})
+        # 标准化新浪数据列名
+        # 新浪返回：date, open, high, low, close, volume, amount, outstanding_share, turnover
+        if df is not None and not df.empty:
+            # 确保日期列存在
+            if 'date' in df.columns:
+                df = df.rename(columns={'date': '日期'})
 
-                # 映射其他列以匹配 _normalize_data 的期望
-                # _normalize_data 期望：日期, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 换手率
-                rename_map = {
-                    'open': '开盘', 'high': '最高', 'low': '最低',
-                    'close': '收盘', 'volume': '成交量', 'amount': '成交额',
-                    'turnover': '换手率',
-                }
-                df = df.rename(columns=rename_map)
+            # 映射其他列以匹配 _normalize_data 的期望
+            # _normalize_data 期望：日期, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 换手率
+            rename_map = {
+                'open': '开盘', 'high': '最高', 'low': '最低',
+                'close': '收盘', 'volume': '成交量', 'amount': '成交额',
+                'turnover': '换手率',
+            }
+            df = df.rename(columns=rename_map)
 
-                # 新浪 turnover 列是小数比率（0.104325 = 10.43%），转为百分数
-                if '换手率' in df.columns:
-                    df['换手率'] = df['换手率'] * 100
+            # 新浪 turnover 列是小数比率（0.104325 = 10.43%），转为百分数
+            if '换手率' in df.columns:
+                df['换手率'] = df['换手率'] * 100
 
-                # 计算涨跌幅（新浪接口可能不返回）
-                if '收盘' in df.columns:
-                    df['涨跌幅'] = df['收盘'].pct_change() * 100
-                    df['涨跌幅'] = df['涨跌幅'].fillna(0)
+            # 计算涨跌幅（新浪接口可能不返回）
+            if '收盘' in df.columns:
+                df['涨跌幅'] = df['收盘'].pct_change() * 100
+                df['涨跌幅'] = df['涨跌幅'].fillna(0)
 
-                return df
-            return pd.DataFrame()
-
-        except Exception as e:
-            raise e
+            return df
+        return pd.DataFrame()
 
     def _fetch_stock_data_tx(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
@@ -418,37 +410,33 @@ class AkshareFetcher(BaseFetcher):
 
         self._enforce_rate_limit()
 
-        try:
-            df = ak.stock_zh_a_hist_tx(
+        df = ak.stock_zh_a_hist_tx(
                 symbol=symbol,
                 start_date=start_date.replace('-', ''),
                 end_date=end_date.replace('-', ''),
                 adjust="qfq"
             )
 
-            # 标准化腾讯数据列名
-            # 腾讯返回：date, open, close, high, low, volume, amount
-            if df is not None and not df.empty:
-                rename_map = {
-                    'date': '日期', 'open': '开盘', 'high': '最高',
-                    'low': '最低', 'close': '收盘', 'volume': '成交量',
-                    'amount': '成交额'
-                }
-                df = df.rename(columns=rename_map)
+        # 标准化腾讯数据列名
+        # 腾讯返回：date, open, close, high, low, volume, amount
+        if df is not None and not df.empty:
+            rename_map = {
+                'date': '日期', 'open': '开盘', 'high': '最高',
+                'low': '最低', 'close': '收盘', 'volume': '成交量',
+                'amount': '成交额'
+            }
+            df = df.rename(columns=rename_map)
 
-                # 腾讯数据通常包含 '涨跌幅'，如果没有则计算
-                if 'pct_chg' in df.columns:
-                    df = df.rename(columns={'pct_chg': '涨跌幅'})
-                elif '收盘' in df.columns:
-                    df['涨跌幅'] = df['收盘'].pct_change() * 100
-                    df['涨跌幅'] = df['涨跌幅'].fillna(0)
+            # 腾讯数据通常包含 '涨跌幅'，如果没有则计算
+            if 'pct_chg' in df.columns:
+                df = df.rename(columns={'pct_chg': '涨跌幅'})
+            elif '收盘' in df.columns:
+                df['涨跌幅'] = df['收盘'].pct_change() * 100
+                df['涨跌幅'] = df['涨跌幅'].fillna(0)
 
-                return df
-            return pd.DataFrame()
+            return df
+        return pd.DataFrame()
 
-        except Exception as e:
-            raise e
-    
     def _fetch_etf_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
         获取 ETF 基金历史数据
@@ -730,7 +718,7 @@ class AkshareFetcher(BaseFetcher):
             # 美股不使用 Akshare，由 YfinanceFetcher 处理
             logger.debug(f"[API跳过] {stock_code} 是美股，Akshare 不支持美股实时行情")
             return None
-        elif _is_hk_code(stock_code):
+        elif is_hk_market(stock_code):
             return self._get_hk_realtime_quote(stock_code)
         elif is_etf_code(stock_code):
             source_key = "akshare_etf"
@@ -1280,12 +1268,7 @@ class AkshareFetcher(BaseFetcher):
             self._enforce_rate_limit()
             
             # 确保代码格式正确（5位数字）
-            raw_code = stock_code.strip().lower()
-            if raw_code.endswith('.hk'):
-                raw_code = raw_code[:-3]
-            if raw_code.startswith('hk'):
-                raw_code = raw_code[2:]
-            code = raw_code.zfill(5)
+            code = stock_code.strip().lower().replace('.hk', '').removeprefix('hk').zfill(5)
             
             logger.info(f"[API调用] ak.stock_hk_spot_em() 获取港股实时行情...")
             import time as _time
@@ -1445,7 +1428,7 @@ class AkshareFetcher(BaseFetcher):
             df = ak.stock_individual_fund_flow(stock=stock_code, market=market)
 
             if df is None or df.empty:
-                logger.warning(f"[Akshare] {stock_code} 主力资金流数据为空")
+                logger.debug(f"[Akshare] {stock_code} 主力资金流数据为空")
                 return None
 
             # 标准化列名
@@ -1464,7 +1447,7 @@ class AkshareFetcher(BaseFetcher):
 
             # 确保必需的列存在
             if 'date' not in df.columns or 'main_net_inflow' not in df.columns:
-                logger.warning(f"[Akshare] {stock_code} 主力资金流数据格式异常: {df.columns.tolist()}")
+                logger.debug(f"[Akshare] {stock_code} 主力资金流数据格式异常: {df.columns.tolist()}")
                 return None
 
             # 转换数据类型
@@ -1480,5 +1463,5 @@ class AkshareFetcher(BaseFetcher):
             return df[['date', 'main_net_inflow']]
 
         except Exception as e:
-            logger.error(f"[Akshare] {stock_code} 获取主力资金流失败: {e}")
+            logger.debug(f"[Akshare] {stock_code} 获取主力资金流失败: {e}")
             return None
