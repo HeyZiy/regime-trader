@@ -1,43 +1,260 @@
 [
-  {"code": "512880", "name": "证券ETF国泰", "industry": "非银金融", "note": "首选"},
-  {"code": "512000", "name": "券商ETF华宝", "industry": "非银金融", "note": "备选"},
-  {"code": "515010", "name": "证券ETF华夏", "industry": "非银金融", "note": "卫星持仓监控"},
-  {"code": "512800", "name": "银行ETF华宝", "industry": "银行", "note": "首选"},
-  {"code": "159819", "name": "人工智能ETF易方达", "industry": "计算机", "note": "首选；妙想无法交易需手动"},
-  {"code": "159852", "name": "软件ETF嘉实", "industry": "计算机", "note": "备选；妙想无法交易需手动"},
-  {"code": "512720", "name": "计算机ETF国泰", "industry": "计算机", "note": "沪市可自动交易"},
-  {"code": "159363", "name": "创业板人工智能ETF华宝", "industry": "计算机", "note": "卫星持仓监控；妙想无法交易需手动"},
-  {"code": "512170", "name": "医疗ETF华宝", "industry": "医药生物", "note": "首选"},
-  {"code": "159992", "name": "创新药ETF银华", "industry": "医药生物", "note": "备选；妙想无法交易需手动"},
-  {"code": "513120", "name": "港股创新药ETF广发", "industry": "医药生物", "note": "卫星持仓监控"},
-  {"code": "159938", "name": "医药ETF", "industry": "医药生物", "note": "核心基准，仅行业PE映射"},
-  {"code": "588200", "name": "科创芯片ETF嘉实", "industry": "电子", "note": "首选"},
-  {"code": "159516", "name": "半导体设备ETF国泰", "industry": "电子", "note": "备选；妙想无法交易需手动"},
-  {"code": "588170", "name": "科创半导体ETF华夏", "industry": "电子", "note": "卫星持仓监控"},
-  {"code": "515880", "name": "通信ETF国泰", "industry": "通信", "note": "首选"},
-  {"code": "512710", "name": "军工龙头ETF富国", "industry": "国防军工", "note": "首选"},
-  {"code": "512660", "name": "军工ETF国泰", "industry": "国防军工", "note": "备选"},
-  {"code": "562500", "name": "机器人ETF华夏", "industry": "机械设备", "note": "首选"},
-  {"code": "159530", "name": "机器人ETF易方达", "industry": "机械设备", "note": "备选；妙想无法交易需手动"},
-  {"code": "512690", "name": "酒ETF鹏华", "industry": "食品饮料", "note": "首选"},
-  {"code": "159928", "name": "消费ETF汇添富", "industry": "食品饮料", "note": "核心基准，仅行业PE映射"},
-  {"code": "159326", "name": "电网设备ETF华夏", "industry": "电力设备", "note": "首选；妙想无法交易需手动"},
-  {"code": "159755", "name": "电池ETF广发", "industry": "电力设备", "note": "备选；妙想无法交易需手动"},
-  {"code": "512400", "name": "有色金属ETF南方", "industry": "有色金属", "note": "首选"},
-  {"code": "517520", "name": "黄金股ETF永赢", "industry": "有色金属", "note": "备选"},
-  {"code": "515220", "name": "煤炭ETF国泰", "industry": "煤炭", "note": "首选"},
-  {"code": "159981", "name": "能源化工期货ETF建信", "industry": "石油石化", "note": "首选，商品期货ETF；妙想无法交易需手动"},
-  {"code": "159697", "name": "石油天然气ETF鹏华", "industry": "石油石化", "note": "备选；妙想无法交易需手动"},
-  {"code": "159611", "name": "电力ETF广发", "industry": "公用事业", "note": "首选；妙想无法交易需手动"},
-  {"code": "159870", "name": "化工ETF鹏华", "industry": "基础化工", "note": "首选；妙想无法交易需手动"},
-  {"code": "515210", "name": "钢铁ETF国泰", "industry": "钢铁", "note": "唯一选择"},
-  {"code": "512200", "name": "房地产ETF南方", "industry": "房地产", "note": "首选"},
-  {"code": "516970", "name": "基建ETF广发", "industry": "建筑装饰", "note": "首选"},
-  {"code": "159745", "name": "建材ETF国泰", "industry": "建筑材料", "note": "首选；妙想无法交易需手动"},
-  {"code": "512580", "name": "环保ETF广发", "industry": "环保", "note": "唯一选择，流动性弱"},
-  {"code": "159766", "name": "旅游ETF富国", "industry": "社会服务", "note": "首选；妙想无法交易需手动"},
-  {"code": "516560", "name": "养老ETF华宝", "industry": "社会服务", "note": "核心基准，仅行业PE映射"},
-  {"code": "159996", "name": "家电ETF国泰", "industry": "家用电器", "note": "首选；妙想无法交易需手动"},
-  {"code": "159865", "name": "养殖ETF国泰", "industry": "农林牧渔", "note": "首选；妙想无法交易需手动"},
-  {"code": "159869", "name": "游戏ETF华夏", "industry": "传媒", "note": "首选；妙想无法交易需手动"}
+ {
+  "code": "512880",
+  "name": "证券ETF国泰",
+  "industry": "非银金融",
+  "note": "首选"
+ },
+ {
+  "code": "512000",
+  "name": "券商ETF华宝",
+  "industry": "非银金融",
+  "note": "备选"
+ },
+ {
+  "code": "515010",
+  "name": "证券ETF华夏",
+  "industry": "非银金融",
+  "note": "卫星持仓监控"
+ },
+ {
+  "code": "512800",
+  "name": "银行ETF华宝",
+  "industry": "银行",
+  "note": "首选"
+ },
+ {
+  "code": "159819",
+  "name": "人工智能ETF易方达",
+  "industry": "计算机",
+  "note": "首选；妙想无法交易需手动",
+  "group": "AI算力"
+ },
+ {
+  "code": "159852",
+  "name": "软件ETF嘉实",
+  "industry": "计算机",
+  "note": "备选；妙想无法交易需手动"
+ },
+ {
+  "code": "512720",
+  "name": "计算机ETF国泰",
+  "industry": "计算机",
+  "note": "沪市可自动交易"
+ },
+ {
+  "code": "159363",
+  "name": "创业板人工智能ETF华宝",
+  "industry": "计算机",
+  "note": "卫星持仓监控；妙想无法交易需手动",
+  "group": "AI算力"
+ },
+ {
+  "code": "512170",
+  "name": "医疗ETF华宝",
+  "industry": "医药生物",
+  "note": "首选"
+ },
+ {
+  "code": "159992",
+  "name": "创新药ETF银华",
+  "industry": "医药生物",
+  "note": "备选；妙想无法交易需手动"
+ },
+ {
+  "code": "513120",
+  "name": "港股创新药ETF广发",
+  "industry": "医药生物",
+  "note": "卫星持仓监控"
+ },
+ {
+  "code": "159938",
+  "name": "医药ETF",
+  "industry": "医药生物",
+  "note": "核心基准，仅行业PE映射"
+ },
+ {
+  "code": "588200",
+  "name": "科创芯片ETF嘉实",
+  "industry": "电子",
+  "note": "首选",
+  "group": "AI算力"
+ },
+ {
+  "code": "159516",
+  "name": "半导体设备ETF国泰",
+  "industry": "电子",
+  "note": "备选；妙想无法交易需手动"
+ },
+ {
+  "code": "588170",
+  "name": "科创半导体ETF华夏",
+  "industry": "电子",
+  "note": "卫星持仓监控",
+  "group": "AI算力"
+ },
+ {
+  "code": "515880",
+  "name": "通信ETF国泰",
+  "industry": "通信",
+  "note": "首选",
+  "group": "AI算力"
+ },
+ {
+  "code": "512710",
+  "name": "军工龙头ETF富国",
+  "industry": "国防军工",
+  "note": "首选"
+ },
+ {
+  "code": "512660",
+  "name": "军工ETF国泰",
+  "industry": "国防军工",
+  "note": "备选"
+ },
+ {
+  "code": "562500",
+  "name": "机器人ETF华夏",
+  "industry": "机械设备",
+  "note": "首选"
+ },
+ {
+  "code": "159530",
+  "name": "机器人ETF易方达",
+  "industry": "机械设备",
+  "note": "备选；妙想无法交易需手动"
+ },
+ {
+  "code": "512690",
+  "name": "酒ETF鹏华",
+  "industry": "食品饮料",
+  "note": "首选"
+ },
+ {
+  "code": "159928",
+  "name": "消费ETF汇添富",
+  "industry": "食品饮料",
+  "note": "核心基准，仅行业PE映射"
+ },
+ {
+  "code": "159326",
+  "name": "电网设备ETF华夏",
+  "industry": "电力设备",
+  "note": "首选；妙想无法交易需手动"
+ },
+ {
+  "code": "159755",
+  "name": "电池ETF广发",
+  "industry": "电力设备",
+  "note": "备选；妙想无法交易需手动"
+ },
+ {
+  "code": "512400",
+  "name": "有色金属ETF南方",
+  "industry": "有色金属",
+  "note": "首选"
+ },
+ {
+  "code": "517520",
+  "name": "黄金股ETF永赢",
+  "industry": "有色金属",
+  "note": "备选"
+ },
+ {
+  "code": "515220",
+  "name": "煤炭ETF国泰",
+  "industry": "煤炭",
+  "note": "首选"
+ },
+ {
+  "code": "159981",
+  "name": "能源化工期货ETF建信",
+  "industry": "石油石化",
+  "note": "首选;特殊品种:商品期货(易盛能化A,T+0非股票);妙想无法交易需手动"
+ },
+ {
+  "code": "159697",
+  "name": "石油天然气ETF鹏华",
+  "industry": "石油石化",
+  "note": "备选；妙想无法交易需手动"
+ },
+ {
+  "code": "159611",
+  "name": "电力ETF广发",
+  "industry": "公用事业",
+  "note": "首选；妙想无法交易需手动"
+ },
+ {
+  "code": "159870",
+  "name": "化工ETF鹏华",
+  "industry": "基础化工",
+  "note": "首选；妙想无法交易需手动"
+ },
+ {
+  "code": "515210",
+  "name": "钢铁ETF国泰",
+  "industry": "钢铁",
+  "note": "唯一选择;降级备选(流动性弱,20日均成交0.76亿);单标的上限减半"
+ },
+ {
+  "code": "512200",
+  "name": "房地产ETF南方",
+  "industry": "房地产",
+  "note": "首选"
+ },
+ {
+  "code": "516970",
+  "name": "基建ETF广发",
+  "industry": "建筑装饰",
+  "note": "降级备选(流动性弱,0.33亿);单标的上限减半"
+ },
+ {
+  "code": "159745",
+  "name": "建材ETF国泰",
+  "industry": "建筑材料",
+  "note": "降级备选(流动性弱,0.44亿);妙想无法交易需手动"
+ },
+ {
+  "code": "512580",
+  "name": "环保ETF广发",
+  "industry": "环保",
+  "note": "唯一选择;降级备选(流动性极弱,0.08亿);单标的上限减半;量能触发建议改行业指数口径"
+ },
+ {
+  "code": "159766",
+  "name": "旅游ETF富国",
+  "industry": "社会服务",
+  "note": "首选；妙想无法交易需手动"
+ },
+ {
+  "code": "516560",
+  "name": "养老ETF华宝",
+  "industry": "社会服务",
+  "note": "核心基准，仅行业PE映射"
+ },
+ {
+  "code": "159996",
+  "name": "家电ETF国泰",
+  "industry": "家用电器",
+  "note": "降级备选(流动性弱,0.84亿);妙想无法交易需手动"
+ },
+ {
+  "code": "159865",
+  "name": "养殖ETF国泰",
+  "industry": "农林牧渔",
+  "note": "首选；妙想无法交易需手动"
+ },
+ {
+  "code": "159869",
+  "name": "游戏ETF华夏",
+  "industry": "传媒",
+  "note": "首选；妙想无法交易需手动"
+ },
+ {
+  "code": "563300",
+  "name": "中证2000ETF华泰柏瑞",
+  "industry": "风格:小市值",
+  "note": "新增(2026-09-16评估,补G3小市值风格缺口;规模56-70亿,日成交4.7亿);动量同规则;回撤阈值收紧-10%",
+  "group": "风格:小市值"
+ }
 ]

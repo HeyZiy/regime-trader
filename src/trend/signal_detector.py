@@ -3,7 +3,7 @@
 趋势波段策略 — 缩量回踩信号检测
 
 核心买点逻辑：
-- 缩量回踩 MA5（不破5日线 + 换手率>5%）
+- 缩量回踩 MA5（不破5日线 + 换手率>3%）
 - 回踩 MA10（次优，需确认）
 - 缩量贴 MA5（信号3，观察信号：同 setup 但当日收涨未回踩，不是买点，等回踩再接）
 """
@@ -14,6 +14,7 @@ from typing import List
 
 import pandas as pd
 
+from src.trend.cycle_overlay import signal_filter_reason
 from src.trend.veto_rules import FROM_60D_LOW_MAX
 
 logger = logging.getLogger(__name__)
@@ -98,11 +99,11 @@ class TechnicalSignal:
 
 
 def _position_penalty(pos: float) -> float:
-    """位置扣分：距近 60 日低点涨幅越高扣分越重（与 veto V7 同一口径）。
+    """位置扣分：距近 60 日低点涨幅越高扣分越重（信号条件⑥b 同口径）。
 
     映射（线性 0.4 分/百分点）：≤25% 扣 0，30% 扣 2，40% 扣 6，
     50% 扣 10，60% 扣 14，70% 扣 18，≥75% 扣满 20 分。
-    ≥80% 由 veto V7 在前置层否决，不会到达此处。
+    ≥80% 已由条件⑥b（is_overextended）拦在信号产出之前，不会到达此处。
     """
     if pos <= 25:
         return 0.0
@@ -228,6 +229,23 @@ def _compute_signal_score(signal_type: str, metrics: dict) -> int:
     return 50
 
 
+def _apply_cycle_filter(signals: List[TechnicalSignal], df: pd.DataFrame,
+                        code: str, name: str) -> List[TechnicalSignal]:
+    """Cycle 吸收：C1 ATR 扩张过滤 + D1 MA5 方向门。
+
+    后置过滤：信号产出后、返回前剔除。信号 2 的"次日弱转强确认"是次日重新检测，
+    走同一判定。
+    """
+    if not signals:
+        return signals
+    hit = signal_filter_reason(df)
+    if hit is None:
+        return signals
+    rule_id, reason = hit
+    logger.info(f"⛔ Cycle {rule_id} 剔除 {name}({code}) 信号：{reason}")
+    return []
+
+
 def detect_pullback_signals(code: str, name: str, df: pd.DataFrame) -> List[TechnicalSignal]:
     """
     检测缩量回踩 MA5 / MA10 趋势波段信号。
@@ -277,19 +295,16 @@ def detect_pullback_signals(code: str, name: str, df: pd.DataFrame) -> List[Tech
     # 当日涨跌幅是否温和（排除涨停/准涨停和崩盘式下跌）
     is_moderate_change = -5.0 < pct_change < 7.0
 
-    # 计算日内承接：通过上下影线和收盘位置判断资金承接意愿
+    # 计算日内结构：收盘位置与下影线占比（仅作评分维度的排序信号，不参与准入——
+    # 下影线在 A 股中小盘更像抛压而非承接，不宜作门槛）。
     intraday_range = latest['high'] - latest['low']
     if intraday_range > 0:
         close_position = (latest['close'] - latest['low']) / intraday_range
-        upper_shadow_ratio = (latest['high'] - max(latest['open'], latest['close'])) / intraday_range
         lower_shadow_ratio = (min(latest['open'], latest['close']) - latest['low']) / intraday_range
-        has_intraday_support = (
-            close_position > 0.4
-            and lower_shadow_ratio > 0.1
-        )
     else:
+        # 零振幅日（一字线）：取中性值，仅供评分
         close_position = 0.5
-        has_intraday_support = True
+        lower_shadow_ratio = 0.1
 
     # === 策略检查 ===
 
@@ -309,40 +324,16 @@ def detect_pullback_signals(code: str, name: str, df: pd.DataFrame) -> List[Tech
     if turnover_unknown:
         logger.warning(f"  {name}({code}): 换手率缺失，流动性子条件跳过（不因此挡单）")
 
-    # 4. 非情绪过热检查：排除短期涨幅过大、偏离5日线过远、波动剧烈的标的
-    is_euphoric = False
-    recent_3d_gain = recent_5d_gain = recent_max_amplitude = 0.0
-    if len(df) >= 4:
-        recent_3d_gain = (df.iloc[-1]['close'] - df.iloc[-4]['close']) / df.iloc[-4]['close'] * 100
-        recent_5d_gain = (df.iloc[-1]['close'] - df.iloc[-6]['close']) / df.iloc[-6]['close'] * 100 if len(df) >= 6 else 0
-        recent_max_bias_ma5 = max(
-            (df.iloc[i]['close'] - df.iloc[i]['ma5']) / df.iloc[i]['ma5'] * 100
-            for i in range(-min(5, len(df)), 0)
-            if pd.notna(df.iloc[i]['ma5']) and df.iloc[i]['ma5'] > 0
-        ) if len(df) >= 2 else 0
-        # 近3日最大振幅（高波动 = 博弈激烈，不适合低吸）
-        recent_max_amplitude = max(
-            (df.iloc[i]['high'] - df.iloc[i]['low']) / df.iloc[i-1]['close'] * 100
-            for i in range(-3, 0)
-            if df.iloc[i-1]['close'] > 0
-        )
-        if recent_3d_gain >= 18 or recent_5d_gain >= 30 or recent_max_bias_ma5 >= 12 or recent_max_amplitude >= 15:
-            is_euphoric = True
-        # 单日暴涨（涨停/准涨停）视为情绪过热
-        if pct_change > 7.0:
-            is_euphoric = True
-    # MA20 乖离过大：收盘偏离20日线过远，追高风险高
-    # （MA20_BIAS_MAX 与妙想选股语句同源，此处防御性复查）
-    if bias_ma20 > MA20_BIAS_MAX:
-        is_euphoric = True
+    # 4. 非情绪过热检查：MA20 乖离一项，防深延伸入场（单日暴涨由条件⑧覆盖）。
+    is_euphoric = bias_ma20 > MA20_BIAS_MAX
 
-    # 4.4 位置维度：距近60日最低收盘涨幅（与 veto V7 同口径，单一来源引用其常量）
+    # 4.4 位置维度：距近60日最低收盘涨幅（条件⑥b；阈值常量单一来源在 veto_rules.FROM_60D_LOW_MAX）
     #     涨幅≥80% → 信号失效（追高风险极高），<80% 时作为评分扣分维度（见 _position_penalty）
     low_60 = float(df['close'].tail(60).min())
     position_gain = (current_price - low_60) / low_60 * 100 if low_60 > 0 else 0.0
     is_overextended = position_gain >= FROM_60D_LOW_MAX
 
-    # 涨停类拦截由 veto_rules 的 V6（近20日涨跌停≥3天）负责，此处不重复判定。
+    # 涨停妖股过不了多头排列+缩量回踩+非过热条件，无需单独拦截。
 
     # 5. 量能检查：当日成交量 < 5日均量 * 1.1（不允许爆量，而非必须地量）
     current_volume = latest['volume']
@@ -378,12 +369,10 @@ def detect_pullback_signals(code: str, name: str, df: pd.DataFrame) -> List[Tech
         _cond_fails.append(f"放量(vol={current_volume:.0f} vs vol_ma5*1.1={volume_ma5*1.1:.0f})")
     if not (-1.5 < bias_ma5 < 3.5):
         _cond_fails.append(f"乖离率超范围(bias_ma5={bias_ma5:+.2f}%)")
-    if not has_intraday_support:
-        _cond_fails.append(f"日内承接弱(cp={close_position:.2f} us={upper_shadow_ratio:.2f} ls={lower_shadow_ratio:.2f})")
     if not meets_liquidity:
         _cond_fails.append(f"换手率不足(turnover={turnover:.2f}%)")
     if is_euphoric:
-        _cond_fails.append(f"情绪过热(3d={recent_3d_gain:.1f}% 5d={recent_5d_gain:.1f}% 振幅={recent_max_amplitude:.1f}% 涨跌={pct_change:+.2f}% MA20乖离={bias_ma20:+.1f}%)")
+        _cond_fails.append(f"情绪过热(MA20乖离={bias_ma20:+.1f}%≥{MA20_BIAS_MAX:g}%)")
     if is_overextended:
         _cond_fails.append(f"距60日低点涨幅过大({position_gain:+.1f}%≥{FROM_60D_LOW_MAX:g}%)")
     if not recently_above_ma5:
@@ -400,7 +389,7 @@ def detect_pullback_signals(code: str, name: str, df: pd.DataFrame) -> List[Tech
     # 信号3: 缩量贴 MA5 — 同一 setup 的非回踩形态（收涨未回踩），是观察信号而非买点
     # 共用条件：多头排列 + 守住MA5 + 缩量 + 小实体/小跌 + 换手达标 + 非加速 + 涨跌幅温和
     meets_ma5_setup = (holds_ma5 and no_volume_blowoff and -1.5 < bias_ma5 < 3.5
-                       and has_intraday_support and meets_liquidity
+                       and meets_liquidity
                        and not is_euphoric and not is_overextended
                        and recently_above_ma5 and is_moderate_change)
 
@@ -410,26 +399,6 @@ def detect_pullback_signals(code: str, name: str, df: pd.DataFrame) -> List[Tech
             signal_desc = f"缩量回踩MA5（量比{volume_ratio:.2f}）不破5日线，涨跌{pct_change:+.2f}%"
         else:
             signal_desc = f"缩量贴MA5（量比{volume_ratio:.2f}）收涨未回踩，涨跌{pct_change:+.2f}%"
-        if turnover > 8.0 and 2.0 <= pct_change <= 5.0:
-            signal_desc += " ⭐换手活跃具龙头特征"
-        elif turnover > 10.0:
-            signal_desc += f" 换手{turnover:.1f}%分歧剧烈"
-        elif turnover >= 7.0:
-            signal_desc += f" 换手{turnover:.1f}%偏热"
-        elif turnover >= 4.0:
-            signal_desc += f" 换手{turnover:.1f}%正常"
-
-        # --- 一阳三阴形态标注（借鉴 one_yang_three_yin 策略）---
-        if len(df) >= 4:
-            anchor = df.iloc[-4]
-            anchor_pct = (anchor['close'] - anchor['open']) / anchor['open'] * 100 if anchor['open'] > 0 else 0
-            pullback_days = df.iloc[-3:]
-            if anchor_pct > 3.0 and all(row['close'] < row['open'] for _, row in pullback_days.iterrows()):
-                # 量确认：后三天量递减，且平均量 < 阳线量
-                pullback_volumes = df.iloc[-3:]['volume']
-                if (pullback_volumes.is_monotonic_decreasing
-                        and pullback_volumes.mean() < anchor['volume']):
-                    signal_desc += " 📐一阳三阴形态"
 
         # 计算动态评分（near_ma5 与 pullback_ma5 同权重，评分函数内对 near_ma5 封顶 79）
         s1_metrics = {
@@ -464,7 +433,6 @@ def detect_pullback_signals(code: str, name: str, df: pd.DataFrame) -> List[Tech
     # 策略强调"不破5日线"，回踩MA10说明分歧较大，评分降低
     elif (no_volume_blowoff
           and touches_ma10  # 盘中回踩MA10且收盘守住
-          and has_intraday_support
           and meets_liquidity
           and not is_euphoric
           and not is_overextended
@@ -507,8 +475,6 @@ def detect_pullback_signals(code: str, name: str, df: pd.DataFrame) -> List[Tech
             _s2_fails.append(f"放量(vol={current_volume:.0f} vs vol_ma5*1.1={volume_ma5*1.1:.0f})")
         if not touches_ma10:
             _s2_fails.append(f"未触及MA10(low={latest['low']:.2f} vs ma10*1.01={ma10*1.01:.2f})")
-        if not has_intraday_support:
-            _s2_fails.append(f"日内承接弱(cp={close_position:.2f} us={upper_shadow_ratio:.2f} ls={lower_shadow_ratio:.2f})")
         if not meets_liquidity:
             _s2_fails.append(f"换手率不足(turnover={turnover:.2f}%)")
         if is_euphoric:
@@ -519,4 +485,5 @@ def detect_pullback_signals(code: str, name: str, df: pd.DataFrame) -> List[Tech
 
     # 注意：不放量突破信号 — 策略明确规定"不做加速追高"
 
-    return signals
+    # Cycle 吸收：C1/D1 后置过滤（命中即剔除当日信号）。
+    return _apply_cycle_filter(signals, df, code, name)

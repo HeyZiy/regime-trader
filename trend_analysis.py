@@ -10,16 +10,15 @@
 1. 每日执行妙想选股得到选股名单（截面状态条件，纯内存，不读不写妙想自选），直接技术分析
 2. 市场环境过滤（调用 market_gate 模块）
 3. 纯技术分析（缩量回踩MA5等规则）
-4. 选股名单当日跳过（趋势破坏/负面清单，仅影响当日结果，次日名单随新一轮妙想选股自然更新）
+4. 负面清单否决（V1/V4 硬否决 + V5 观察项，仅影响当日结果，次日名单随新一轮妙想选股自然更新）
 
-拦截层（自下而上，越靠下越"硬"）：
-- market_gate：市场环境层，市场状态不允许时不开仓
-- veto_rules：负面清单（8 条硬否决），任一触发即不进信号池、不看评分
-- skip_rules：趋势破坏跳过（连续2天跌破10日线等）
-- signal_detector：买点形态 + 信号质量门（情绪过热等）
+拦截层（按执行顺序）：
+- market_gate + cycle_stage：市场环境层——gate 五态决定能否开仓，Cycle A1/A2 决定开多大
+- veto_rules：负面清单（V1/V4 硬否决；V5 主力资金已降级为观察项），触发即不进信号池、不看评分
+- signal_detector：买点形态 + 信号质量门（Cycle C1/D1 过滤 + ⑥b 中期过热等）
 
 核心策略：
-- 买点：主升中的缩量回踩MA5（不破5日线 + 换手率>5%）
+- 买点：主升中的缩量回踩MA5（不破5日线 + 换手率>3%）
 - 不做：加速追高、情绪高潮接力、连续大阳后追涨
 - 环境过滤：见 strategy/market.md
 - 选股名单每天由妙想选股重新生成：选股条件是信号触发条件的截面必要子集，
@@ -38,7 +37,7 @@ import logging
 import os
 import sys
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -49,13 +48,13 @@ from src.notify.service import NotificationService
 from src.mx.service import MXService
 from src.mx.position_utils import filter_stock_positions
 from src.mx.client import MXMoniClient
+from src.market_state.cycle_stage import (
+    evaluate_open_gate, run_cycle_stage, save_cycle_state,
+)
 from src.market_state.market_gate import (
     check_market_gate, diagnose_regime, fetch_index_df,
 )
 from src.trend.analyzer import StockTrendAnalyzer
-from src.trend.skip_rules import (
-    SkipStats, check_skip_rules_detail,
-)
 from src.trend.veto_rules import (
     check_external_veto, check_market_veto, VetoStats,
     FROM_60D_LOW_MAX, TURNOVER_DAY_MAX,
@@ -71,8 +70,8 @@ logger = logging.getLogger(__name__)
 # 妙想选股默认关键词：生成当日选股名单的"状态层"条件（截面状态，一次批量查询可得）。
 # 分层原则：截面状态 → 妙想选股；事件/路径（公告、资金流、大跌统计）→ veto_rules；
 # 盘中形态（下影线、量比、收盘位置）→ signal_detector。
-# 阈值单一来源：换手当日上限与 V3 同源（口径不同）、乖离与信号1条件⑥同源、
-# 60日位置与 V7 同源，均引用各规则模块常量。
+# 阈值单一来源：换手当日上限为选股截面条件、乖离与信号1条件⑥同源、
+# 60日位置与信号条件⑥b 同源，均引用各规则模块常量。
 # 精筛由 signal_detector 负责；信号层保留同阈值防御性复查。
 # 实测妙想可正常解析全部子句。
 DEFAULT_SCREEN_KEYWORD = (
@@ -127,8 +126,8 @@ class SimpleTechnicalAnalyzer:
         """
         获取股票历史数据（直接从网络获取）
 
-        天数口径为自然日：95 天约 65 个交易日，满足负面清单 60 日类规则
-        （V2/V7 需 61 根 K 线）与 MA60 的计算需求。
+        天数口径为自然日：95 天约 65 个交易日，满足 60 日位置类判定
+        （信号条件⑥b 需 61 根 K 线）与 MA60 的计算需求。
 
         Args:
             code: 股票代码
@@ -226,14 +225,12 @@ class SimpleTechnicalAnalyzer:
                           notifier: Any = None,
                           ) -> Tuple[List[TechnicalSignal],
                                      List[Tuple[str, str, str]],
-                                     List[Tuple[str, str, str]],
-                                     List[Tuple[str, str, str, str]],
-                                     SkipStats]:
+                                     List[Tuple[str, str, str, str]]]:
         """
-        分析选股名单，返回技术信号列表、趋势破坏跳过列表、失败列表、否决列表与跳过规则统计
+        分析选股名单，返回技术信号列表、失败列表、否决列表
 
-        准入顺序：跳过规则（趋势破坏） → 负面清单行情类否决 → 买点信号检测
-                  → 负面清单外部数据类否决（仅信号候选）
+        准入顺序：负面清单行情类否决（V4） → 买点信号检测（含 Cycle C1/D1 过滤）
+                  → 负面清单外部数据类否决/观察（仅信号候选）
 
         Args:
             stock_list: [(code, name), ...]
@@ -242,17 +239,13 @@ class SimpleTechnicalAnalyzer:
 
         Returns:
             (技术信号列表,
-             [(code, name, 跳过原因), ...],
              [(code, name, 失败原因), ...],
-             [(code, name, 否决动作, 否决原因), ...],
-             跳过规则逐条统计 SkipStats)
+             [(code, name, 否决动作, 否决原因), ...])
              否决动作统一为跳过当日信号
         """
         all_signals = []
-        skipped_stocks = []
         failed_stocks = []
         vetoed_stocks = []
-        stats = SkipStats()
         veto_stats = VetoStats()
 
         if max_stocks and len(stock_list) > max_stocks:
@@ -271,25 +264,12 @@ class SimpleTechnicalAnalyzer:
             try:
                 df = self.fetch_stock_data(code)
 
-                # 统一计算 MA，避免在跳过检查和信号检测中重复计算
+                # 统一计算 MA，避免在负面清单检查和信号检测中重复计算
                 if df is not None and len(df) >= 10:
                     df = df.sort_values('date').reset_index(drop=True)
                     df = self.trend_analyzer._calculate_mas(df)
 
-                # 逐条跑完 4 条规则：既给出跳过结论，也累积「检查 N 只 / 触发 N 只」统计。
-                # 短路结论直接从明细取第一个触发项（与 check_skip_rules 等价），
-                # 避免重跑一遍规则导致统计日志重复输出。
-                checks = check_skip_rules_detail(code, df)
-                stats.record(f"{name}({code})", checks)
-                should_skip, skip_reason = next(
-                    ((True, c.reason) for c in checks if c.triggered), (False, "")
-                )
-                if should_skip:
-                    skipped_stocks.append((code, name, skip_reason))
-                    logger.info(f"⏭️ 跳过 {name}({code}): {skip_reason}")
-                    continue
-
-                # 负面清单（行情类）：任一规则触发即否决，不进信号池、不看评分
+                # 负面清单（行情类 V4）：任一规则触发即否决，不进信号池、不看评分
                 market_veto, market_skipped = check_market_veto(code, name, df, veto_stats)
                 if market_veto.vetoed:
                     vetoed_stocks.append(
@@ -301,7 +281,9 @@ class SimpleTechnicalAnalyzer:
 
                 if signals:
                     # 负面清单（外部数据类）：只对已产出信号的候选惰性调用妙想 API
-                    ext_veto, ext_skipped = check_external_veto(code, name, self.mx_service, self.fetcher, veto_stats)
+                    # （V1 公告否决；V5 主力资金已降级为观察项，observations 随信号展示）
+                    ext_veto, ext_skipped, observations = check_external_veto(
+                        code, name, self.mx_service, self.fetcher, veto_stats)
                     if ext_veto.vetoed:
                         vetoed_stocks.append(
                             (code, name, ext_veto.action, '；'.join(ext_veto.reasons))
@@ -315,6 +297,8 @@ class SimpleTechnicalAnalyzer:
                         s.sector = sector
                         if veto_skipped:
                             s.veto_skipped = veto_skipped
+                        for obs in observations:
+                            s.description += f"；👁️ {obs}（观察项，不拦截）"
                     logger.info(f"✅ {name}({code}) [{sector}]: 发现 {len(signals)} 个信号")
 
                     # 即时推送：每只股票一旦检出达标买点立即发一条
@@ -338,17 +322,15 @@ class SimpleTechnicalAnalyzer:
 
         all_signals.sort(key=lambda x: x.score, reverse=True)
 
-        kept_count = len(stock_list) - len(skipped_stocks) - len(vetoed_stocks) - len(failed_stocks)
+        kept_count = len(stock_list) - len(vetoed_stocks) - len(failed_stocks)
         logger.info(
-            f"处理完成 | 保留:{kept_count} 跳过:{len(skipped_stocks)} "
+            f"处理完成 | 保留:{kept_count} "
             f"负面清单否决:{len(vetoed_stocks)} "
             f"失败:{len(failed_stocks)} 信号:{len(all_signals)}"
         )
-        # 逐条输出跳过规则的检查/触发统计（让"跳过 N 只"可解释、未实现项可见）
-        stats.log_summary()
         # 逐条输出负面清单规则的检查/否决/放行统计
         veto_stats.log_summary()
-        return all_signals, skipped_stocks, failed_stocks, vetoed_stocks, stats
+        return all_signals, failed_stocks, vetoed_stocks
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -455,6 +437,26 @@ def _fetch_held_codes() -> set:
     return {canonical_stock_code(p.get("code", "")) for p in positions}
 
 
+def _fetch_portfolio_exposure() -> Tuple[float, float]:
+    """读妙想账户敞口：(持仓市值, 总资产)（元），供 Cycle A1 组合档位截断（每日一次）。
+
+    持仓市值 = 总资产 − 可用余额。取不到（未配 MX_APIKEY / 接口失败）时返回
+    (0.0, 0.0) → evaluate_open_gate 的截断分支跳过（fail-open，与 _fetch_held_codes
+    的降级取向一致：数据缺失不放大拦截）。
+    """
+    if not os.getenv("MX_APIKEY"):
+        logger.warning("未配置 MX_APIKEY，Cycle 档位跳过组合敞口检查（fail-open）")
+        return 0.0, 0.0
+    try:
+        bal = MXMoniClient().get_balance() or {}
+        equity = float(bal.get("total_assets", 0) or 0)
+        avail = float(bal.get("avail_balance", 0) or 0)
+        return max(equity - avail, 0.0), equity
+    except Exception as e:
+        logger.warning(f"读取妙想资金失败，Cycle 档位跳过组合敞口检查: {e}")
+        return 0.0, 0.0
+
+
 def _save_report(report: str) -> str:
     """将报告保存到文件并返回路径。"""
     reports_dir = "reports"
@@ -539,18 +541,30 @@ def main():
         regime_diag = diagnose_regime(index_df)
         logger.info(f"市场状态判定明细 → {regime_diag.describe()}")
 
+        # ── Cycle 吸收：指数循环定位（A1 仓位档位 + A2 快速通道）──
+        # A2 可在 gate 禁开日按快速通道放行（cap=cap_bottom，仅当日）；A1 顶部延伸档位
+        # 截断新开仓；stage/cap 快照进日报「市场环境」节并存 data/cycle_state.json。
+        cycle_info = None
+        cycle_snap = run_cycle_stage(index_df)
+        if cycle_snap:
+            save_cycle_state(cycle_snap)
+            invested, equity = _fetch_portfolio_exposure()
+            allow, _cap, cap_note = evaluate_open_gate(can_trade, cycle_snap, invested, equity)
+            if cap_note:
+                logger.info(f"Cycle 档位裁决：{cap_note}")
+            can_trade = allow
+            cycle_info = {**cycle_snap, "cap_note": cap_note}
         market_env = (can_trade, market_summary, market_regime)
         notifier = None if args.no_notify else NotificationService()
 
-        # 2. 技术分析（包含跳过检查）
+        # 2. 技术分析
         stock_list = list(zip(stock_codes, [name_mapping.get(c, c) for c in stock_codes]))
         logger.info(f"待分析列表: {len(stock_list)} 只股票")
 
-        signals, skipped_stocks, failed_stocks, vetoed_stocks, skip_stats = analyzer.analyze_all_stocks(
+        signals, failed_stocks, vetoed_stocks = analyzer.analyze_all_stocks(
             stock_list, max_stocks=max_stocks, sort_by_pct=False,
             market_env=market_env, notifier=notifier,
         )
-
 
         # 4.5 已持仓股票抑制买入信号（避免"持有又提示买入"）
         held_codes = _fetch_held_codes()
@@ -566,11 +580,12 @@ def main():
             logger.info("推送今日信号汇总")
             _send_notification(summary_alert, notifier)
 
-        report = generate_technical_report(all_signals, skipped_stocks,
+        report = generate_technical_report(signals,
                                            market_env=market_env,
                                            failed_stocks=failed_stocks,
                                            vetoed_stocks=vetoed_stocks,
-                                           regime_diag=regime_diag)
+                                           regime_diag=regime_diag,
+                                           cycle_info=cycle_info)
 
         # 5. 保存报告
         _save_report(report)

@@ -8,13 +8,15 @@
 
 1. 读取妙想模拟仓股票持仓（持仓事实来源）
 2. 复用 src/trend/sell_rules.py 的完全分类规则检测卖出信号
-   （第一卖点减仓50% / 第二卖点清仓 / 移动止盈 peak×0.90 + 16 个交易日到期 / 止盈保护减半）
+   （第一卖点减仓50%：放量破5日线/回撤≥5%/板块走弱；第二卖点清仓：破位+16日到期；
+   Cycle 吸收 B1 延伸计数并入动作池）
 3. 命中即自动下模拟仓市价单（委托数量为 100 整数倍，按可用股数收敛）
 4. 自行渲染成交报告并推送
 
 执行约定：
 - reduce_half（减仓50%）/ clear（清仓）均自动下市价单，无需人工确认。
-- 移动止盈峰值每日更新并落盘 data/position_exit_state.json（只升不降；加仓入场日推进时重置）。
+- 持仓峰值（peak）每日更新并落盘 data/position_exit_state.json（只升不降；加仓入场日
+  推进时重置），仅作状态留痕，不触发卖出。
 - 逐只隔离：单只取数或下单失败不影响其余持仓，最终汇总四类结果
   （success / failed / manual_skip / insufficient）。
 - 不可交易标的（1 开头深市 ETF/LOF，见 src/mx/client.py）记为 manual_skip 单列提示。
@@ -43,8 +45,8 @@ from src.mx.position_utils import (
     filter_stock_positions, get_last_buy_dates_safe, position_profit_pct,
 )
 from src.notify.service import NotificationService
+from src.trend.cycle_overlay import ExhaustionTracker
 from src.trend.sell_rules import (
-    TRAIL_TRIGGER_FACTOR,
     HoldingRow, SellSignal, detect_sell_signals, fetch_sector_pct_map, match_sector_pct,
 )
 from src.trend.signal_detector import UNKNOWN_SECTOR
@@ -52,9 +54,14 @@ setup_env()
 
 logger = logging.getLogger(__name__)
 
-# 持仓退出状态（移动止盈 peak / 入场价 / 入场日），每日 14:45 运行时更新落盘。
+# 持仓退出状态（peak / 入场价 / 入场日），每日 14:45 运行时更新落盘。
 # peak 只升不降：跨日峰值记忆不依赖行情窗口，加仓/换仓通过入场日判重自然重置。
 EXIT_STATE_FILE = Path(__file__).parent / "data" / "position_exit_state.json"
+
+# 板块行情连续失败 ≥ N 个运行日 → 板块类卖出规则（板块走弱/主线退潮）自动停用
+# 并 ERROR 告警，直到某次成功拉取自动恢复。
+SECTOR_HEALTH_FILE = Path(__file__).parent / "data" / "sector_fetch_health.json"
+SECTOR_FAIL_DISABLE_STREAK = 5
 
 # 执行结果状态
 ST_SUCCESS = "success"          # 委托成功
@@ -180,15 +187,16 @@ def _save_exit_state(state: Dict[str, dict]) -> None:
 
 
 def _build_exit_ctx(df: pd.DataFrame, position: dict, entry_date_str: str,
-                    state_entry: dict) -> Optional[dict]:
-    """构建单只持仓的退出上下文（移动止盈触发价 + 持有交易日数），并更新峰值。
+                    state_entry: dict) -> dict:
+    """构建单只持仓的退出上下文（持有交易日数），并更新峰值。
 
     peak = max(历史峰值, 入场价, 入场日（含）以来最高收盘)，只升不降；
     入场日推进（加仓）时重置峰值、从新入场日重算——旧峰值不再适用新腿。
     df 最后一根 bar 为 14:45 近似收盘（尾盘口径），峰值随之更新。
+    peak 仅作状态留痕（审计/未来实验），不生成触发价；退出主干为 16 日到期。
 
     Returns:
-        {trail_trigger, held_days, peak}；算不出 peak 时返回 None（退出主干跳过）
+        {held_days, peak}
     """
     cost = float(position.get("cost_price", 0) or 0)
     ed = None
@@ -201,13 +209,13 @@ def _build_exit_ctx(df: pd.DataFrame, position: dict, entry_date_str: str,
     stored_ed = str(state_entry.get("entry_date", ""))
     if ed is not None and stored_ed and entry_date_str[:10] > stored_ed:
         state_entry["peak"] = 0.0
-        logger.info("入场日推进（加仓），移动止盈峰值重置后重算")
+        logger.info("入场日推进（加仓），持仓峰值重置后重算")
 
     if ed is not None:
         since_entry = df.loc[pd.to_datetime(df["date"]) >= pd.Timestamp(ed), "close"]
         hist_peak = float(since_entry.astype(float).max()) if len(since_entry) else 0.0
     else:
-        # 入场日缺失：回退全窗口取最高（保守偏高 → 触发价偏高 → 更早触发）
+        # 入场日缺失：回退全窗口取最高（保守偏高，仅作峰值留痕）
         hist_peak = float(df["close"].astype(float).max()) if len(df) else 0.0
 
     prev_peak = float(state_entry.get("peak", 0) or 0)
@@ -217,8 +225,6 @@ def _build_exit_ctx(df: pd.DataFrame, position: dict, entry_date_str: str,
     state_entry["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     peak = state_entry["peak"]
-    if peak <= 0:
-        return None
 
     held_days = None
     if ed is not None:
@@ -231,10 +237,62 @@ def _build_exit_ctx(df: pd.DataFrame, position: dict, entry_date_str: str,
             logger.warning(f"持有天数计算失败，到期检查跳过: {e}")
 
     return {
-        "trail_trigger": round(peak * TRAIL_TRIGGER_FACTOR, 4),
         "held_days": held_days,
         "peak": peak,
     }
+
+
+def _load_sector_health() -> Dict:
+    """读取板块行情数据源健康状态（fail-soft：缺失/损坏按初始状态处理）。"""
+    try:
+        if SECTOR_HEALTH_FILE.exists():
+            return json.loads(SECTOR_HEALTH_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"板块健康状态文件读取失败，按初始状态处理: {e}")
+    return {}
+
+
+def _save_sector_health(health: Dict) -> None:
+    try:
+        SECTOR_HEALTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SECTOR_HEALTH_FILE.write_text(
+            json.dumps(health, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning(f"板块健康状态文件写入失败: {e}")
+
+
+def _fetch_sector_pct_map_with_health() -> Tuple[Dict[str, float], bool]:
+    """拉取板块涨跌幅并做数据源健康监控。
+
+    板块行情多源回退数据源脆弱，连续失败达到阈值后自动停用板块类规则并
+    ERROR 告警，避免每日重复报错刷屏；某次成功拉取即自动恢复。
+
+    Returns:
+        (sector_pct_map, disabled) — disabled=True 表示板块类规则已处于停用状态
+    """
+    health = _load_sector_health()
+    sector_map = fetch_sector_pct_map()
+
+    if sector_map:
+        if int(health.get("fail_streak", 0) or 0) >= SECTOR_FAIL_DISABLE_STREAK:
+            logger.info("✅ 板块行情恢复，板块类卖出规则重新启用")
+        health["fail_streak"] = 0
+        _save_sector_health(health)
+        return sector_map, False
+
+    streak = int(health.get("fail_streak", 0) or 0) + 1
+    health["fail_streak"] = streak
+    health["last_fail_date"] = datetime.now().strftime("%Y-%m-%d")
+    _save_sector_health(health)
+
+    disabled = streak >= SECTOR_FAIL_DISABLE_STREAK
+    if disabled:
+        logger.error(
+            f"🔴 板块行情连续 {streak} 个运行日获取失败 → 板块类卖出规则"
+            f"（板块走弱/主线退潮）自动停用，恢复后将自动重新启用"
+        )
+    return {}, disabled
 
 
 def run_sell(analyzer, client: MXMoniClient, dry_run: bool = False
@@ -253,11 +311,18 @@ def run_sell(analyzer, client: MXMoniClient, dry_run: bool = False
         return [], regime
 
     entry_map = get_last_buy_dates_safe(client)
-    sector_pct_map = fetch_sector_pct_map()
+    sector_pct_map, sector_disabled = _fetch_sector_pct_map_with_health()
     if not sector_pct_map:
-        logger.warning("板块行情不可用，板块类卖出规则（板块走弱/主线退潮）跳过")
+        logger.warning(
+            "板块行情不可用，板块类卖出规则（板块走弱/主线退潮）跳过"
+            + ("（连续多日失败，规则停用中，恢复后自动启用）" if sector_disabled else "")
+        )
 
     exit_state = _load_exit_state()
+    # Cycle 吸收：B1 延伸计数。状态寄生 exit_state 每仓 dict：新仓由
+    # setdefault 创建（=on_entry）、循环末尾的 gone-codes 清理移除（=on_exit），
+    # 与持仓峰值 peak 同生命周期。
+    exhaustion = ExhaustionTracker()
     results: List[SellExecution] = []
     for p in positions:
         code = canonical_stock_code(p.get("code", ""))
@@ -283,14 +348,26 @@ def run_sell(analyzer, client: MXMoniClient, dry_run: bool = False
             if df is not None and len(df) >= 10:
                 df = df.sort_values('date').reset_index(drop=True)
                 df = analyzer.trend_analyzer._calculate_mas(df)
-                exit_ctx = _build_exit_ctx(
-                    df, p, entry_map.get(code, ""), exit_state.setdefault(code, {})
-                )
+                state_entry = exit_state.setdefault(code, {})
+                exit_ctx = _build_exit_ctx(df, p, entry_map.get(code, ""), state_entry)
+
+                # Cycle 吸收：B1 延伸计数。bias 用尾盘
+                # 近似收盘口径，与持仓峰值 peak 同源；动作经 ext_action 并入卖出判定。
+                ext_action = None
+                latest = df.iloc[-1]
+                ma10_v, close_v = latest.get("ma10"), latest.get("close")
+                if pd.notna(ma10_v) and float(ma10_v) > 0 and pd.notna(close_v):
+                    bias10 = (float(close_v) - float(ma10_v)) / float(ma10_v) * 100
+                    bar_date = str(pd.to_datetime(df["date"].iloc[-1]).date())
+                    ext_action = exhaustion.update(state_entry, bias10, bar_date)
+                    if ext_action:
+                        logger.info(f"Cycle B1 延伸计数触发 {name}({code})：{ext_action[1]}")
+
                 sig = detect_sell_signals(
-                    code, name, df, p, regime,
+                    code, name, df, p,
                     sector=sector, sector_pct=sector_pct,
                     entry_date=entry_map.get(code, ""),
-                    exit_ctx=exit_ctx,
+                    exit_ctx=exit_ctx, ext_action=ext_action,
                 )
             else:
                 sig = None

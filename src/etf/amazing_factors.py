@@ -401,6 +401,18 @@ ETF_INDUSTRY_MAP: Dict[str, str] = {
     e["code"]: e["industry"] for e in _ETF_INDUSTRY_ENTRIES
 }
 
+# ── 叙事组（2026-09-16 新增） ──
+# 同组 ETF 视为同一叙事槽位：买入去重时组内只保留动量分最高一只（防同叙事双重下注）。
+# 组名可为非申万行业（如 "AI算力"、"风格:小市值"）。无 group 字段的标的按行业去重。
+ETF_GROUP_MAP: Dict[str, str] = {
+    e["code"]: e["group"] for e in _ETF_INDUSTRY_ENTRIES if e.get("group")
+}
+
+
+def get_etf_group(etf_code: str) -> Optional[str]:
+    """查询 ETF 的叙事组名（无组返回 None，去重回退按行业）。"""
+    return ETF_GROUP_MAP.get(etf_code)
+
 
 def get_etf_industry(etf_code: str) -> Optional[str]:
     """查询 ETF 对应的一级行业名。"""

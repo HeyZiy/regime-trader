@@ -4,27 +4,20 @@
 趋势策略 — 持仓卖出信号检测
 ===================================
 
-实现 strategy/trend_strategy.md「卖出」设计稿（正常版 + trending_down 收紧版）。
+实现 strategy/trend_strategy.md「卖出」设计稿（正常版阈值，全市场状态统一）。
 
 第一卖点（减仓50%，满足其一）：
   - 放量跌破5日线（量比≥2 且 收盘<MA5）
-  - 高位长阴吞没（前阳被当日阴线吞没 + 跌幅≥3% + 高位）
   - 从阶段高点回撤≥5%（阶段高点=近20日最高收盘，不含当日）
-  - 板块明显走弱（所属行业板块当日跌幅≤-2%，数据缺失跳过）
+  - 板块明显走弱（所属行业板块当日跌幅≤-2%，数据缺失跳过；数据源健康监控见 trend_sell）
 第二卖点（全仓清仓，满足其一）：
   - 放量跌破10日线（量比≥2 且 收盘<MA10）
   - 主线明显退潮（近似：板块当日跌幅≤-3%）
   - 个股跌破关键平台（近20日最低收盘，不含当日）
-  - 移动止盈触发：现价 ≤ max(持仓期最高收盘, 入场价) × 0.90（peak 只升不降）
   - 持满 16 个交易日到期
-  以上与第一卖点**先到先出**。退出主干的设计依据：止损带在噪声区（入场距 MA10中位仅 3.6%，90% 天然触发且卖在局部低点），
-  移动止盈 10% 回测 +1.10%，显著优于MA10 止损口径的 +0.32%（research/trend_bt/README.md）。
-止盈保护（建议减半）：盈利≥15% 且 放量滞涨（量比≥2 且 涨幅<2% 或 收盘位于日内下半部）
-
-trending_down 收紧版：回撤≥3% / 量比≥1.5 / 板块走弱阈值 -1%
-（退出主干——移动止盈 + 到期——各市场状态一致，不随收紧版变化）。
-sideways/chaos：用**正常版**并照常输出卖出信号——「自然退出」指不收紧阈值，
-不是不执行，正常版的清仓规则在 sideways/chaos 下照常生效。
+  以上与第一卖点**先到先出**。
+Cycle 吸收 B1 延伸计数：bias_MA10 ≥10% 计延伸事件——第 2 次减半、第 3 次清仓，
+动作经 ext_action 并入本模块动作池（取最强：clear > reduce_half）。
 
 持仓事实来源：妙想模拟仓（用户手动同步持仓）。
 
@@ -56,26 +49,16 @@ logger = logging.getLogger(__name__)
 # 卖出动作白名单（渲染层文案与判定分支共用）
 VALID_ACTIONS = ("reduce_half", "clear")
 
-# ── 正常版阈值 ──
+# ── 卖出阈值（全市场状态统一）──
 VOL_RATIO_NORMAL = 2.0        # 放量：当日量/前5日均量 ≥ 2.0
-VOL_RATIO_TIGHT = 1.5         # trending_down 收紧版量比
 DRAWDOWN_NORMAL = 5.0         # 阶段高点回撤减仓阈值（%）
-DRAWDOWN_TIGHT = 3.0          # trending_down 收紧版回撤
 SECTOR_WEAK_NORMAL = -2.0     # 板块明显走弱：当日跌幅 ≤ -2%
-SECTOR_WEAK_TIGHT = -1.0      # trending_down 收紧版
 SECTOR_TIDE_OUT = -3.0        # 主线明显退潮（近似）：当日跌幅 ≤ -3%
-LONG_YIN_PCT = -3.0           # 长阴：当日跌幅 ≤ -3%
-HIGH_5D_GAIN = 10.0           # 高位判定：近5日累计涨幅 ≥ 10%
-HIGH_NEAR_PEAK = 0.97         # 高位判定：收盘 ≥ 近20日高点 × 0.97
 PEAK_WINDOW = 20              # 阶段高点/关键平台回看窗口（交易日，不含当日）
-TP_PROFIT_PCT = 15.0          # 止盈保护盈利线（%）
-TP_STALL_GAIN = 2.0           # 放量滞涨：当日涨幅 < 2%
-TP_CLOSE_POS = 0.4            # 放量滞涨：收盘位于日内区间下 40%
-TRAIL_TRIGGER_FACTOR = 0.90   # 移动止盈触发系数：触发价 = max(持仓期最高收盘, 入场价) × 0.90
 MAX_HOLD_TRADING_DAYS = 16    # 持有上限（交易日，不含入场日）：到期清仓
 
 # 减半后剩余仓位的操作提醒（用户主动执行，不做阶段跟踪）
-REDUCE_NOTE = "减仓后剩余仓位：由移动止盈（持仓期最高收盘×0.90）与 16 个交易日到期接管"
+REDUCE_NOTE = "减仓后剩余仓位：由 B1 延伸计数、阶段高点回撤减半与 16 个交易日到期接管"
 
 
 @dataclass
@@ -190,60 +173,38 @@ def _compute_metrics(df: pd.DataFrame) -> Optional[dict]:
     stage_high = float(window["close"].max()) if not window.empty else close
     platform_low = float(window["close"].min()) if not window.empty else close
 
-    gain5 = 0.0
-    if len(df) >= 7:
-        base = float(df.iloc[-6]["close"])
-        if base > 0:
-            gain5 = (close - base) / base * 100
-
-    high = float(latest.get("high", close) or close)
-    low = float(latest.get("low", close) or close)
-    close_position = (close - low) / (high - low) if high > low else 0.5
-
     return {
         "close": close,
-        "open": float(latest.get("open", close) or close),
         "ma5": ma5,
         "ma10": ma10,
         "ma20": ma20,
-        "prev_close": prev_close,
-        "prev_open": float(prev["open"]) if pd.notna(prev.get("open")) else prev_close,
-        "prev_ma10": float(prev["ma10"]) if pd.notna(prev.get("ma10")) else 0.0,
         "pct_change": pct_change,
         "vol_ratio": vol_ratio,
         "stage_high": stage_high,
         "platform_low": platform_low,
-        "gain5": gain5,
-        "close_position": close_position,
     }
 
 
-def _check_rules(metrics: dict, profit_pct: float, regime: str,
+def _check_rules(metrics: dict,
                  sector_pct: Optional[float],
-                 exit_ctx: Optional[dict] = None) -> Tuple[str, List[str], str]:
+                 exit_ctx: Optional[dict] = None,
+                 ext_action: Optional[Tuple[str, str]] = None) -> Tuple[str, List[str], str]:
     """逐条检查卖出规则。
 
     Args:
         exit_ctx: 持有端退出上下文（trend_sell 从退出状态文件构建）：
-            trail_trigger — 移动止盈触发价 = max(持仓期最高收盘, 入场价) × 0.90
-            held_days     — 已持有交易日数（不含入场日；取不到为 None）
-            peak          — 持仓期最高收盘（只升不降）
+            held_days — 已持有交易日数（不含入场日；取不到为 None）
+        ext_action: Cycle 吸收 B1 延伸动作 (kind, reason)，kind 为 'reduce_half' | 'clear'；
+            由 trend_sell 计算（状态寄生 position_exit_state.json），此处只做合并——
+            并入既有动作池后仍按 clear > reduce_half 取最强，既有规则语义不变。
 
     Returns:
         (action, reasons, note)
         action: 'clear' | 'reduce_half' | ''（空=无信号）
     """
-    # 只有 trending_down 收紧；sideways/weak_up/chaos 一律走正常版并照常输出信号
-    tight = regime == "trending_down"
-    vol_thr = VOL_RATIO_TIGHT if tight else VOL_RATIO_NORMAL
-    dd_thr = DRAWDOWN_TIGHT if tight else DRAWDOWN_NORMAL
-    sector_thr = SECTOR_WEAK_TIGHT if tight else SECTOR_WEAK_NORMAL
-
     close = metrics["close"]
     ma5, ma10 = metrics["ma5"], metrics["ma10"]
     vol_ratio = metrics["vol_ratio"]
-    pct_change = metrics["pct_change"]
-    tag = "（收紧版）" if tight else ""
 
     clear_reasons: List[str] = []
     reduce_reasons: List[str] = []
@@ -252,19 +213,13 @@ def _check_rules(metrics: dict, profit_pct: float, regime: str,
 
     # 持有端退出主干（先到先出）
     if exit_ctx:
-        trigger = exit_ctx.get("trail_trigger")
-        peak = exit_ctx.get("peak") or 0.0
-        if trigger and close <= trigger:
-            clear_reasons.append(
-                f"移动止盈触发（现价{close:.2f} ≤ 触发价{trigger:.2f}，peak {peak:.2f}×0.90）"
-            )
         held = exit_ctx.get("held_days")
         if held is not None and held >= MAX_HOLD_TRADING_DAYS:
             clear_reasons.append(f"持满{MAX_HOLD_TRADING_DAYS}个交易日到期（已持{held}天）")
 
     # 放量跌破 MA10
-    if close < ma10 and vol_ratio >= vol_thr:
-        clear_reasons.append(f"放量跌破MA10{tag}（量比{vol_ratio:.1f}≥{vol_thr}，收盘{close:.2f}<{ma10:.2f}）")
+    if close < ma10 and vol_ratio >= VOL_RATIO_NORMAL:
+        clear_reasons.append(f"放量跌破MA10（量比{vol_ratio:.1f}≥{VOL_RATIO_NORMAL}，收盘{close:.2f}<{ma10:.2f}）")
 
     # 主线明显退潮（近似：板块当日跌幅 ≤ -3%）
     if sector_pct is not None and sector_pct <= SECTOR_TIDE_OUT:
@@ -277,38 +232,29 @@ def _check_rules(metrics: dict, profit_pct: float, regime: str,
     # ── 第一卖点（减仓50%）──
 
     # 放量跌破 MA5
-    if close < ma5 and vol_ratio >= vol_thr:
-        reduce_reasons.append(f"放量跌破5日线{tag}（量比{vol_ratio:.1f}≥{vol_thr}，收盘{close:.2f}<MA5 {ma5:.2f}）")
-
-    # 高位长阴吞没
-    is_yin = close < metrics["open"]
-    prev_yang = metrics["prev_close"] > metrics["prev_open"]
-    engulfing = metrics["open"] >= metrics["prev_close"] and close <= metrics["prev_open"]
-    is_high = metrics["gain5"] >= HIGH_5D_GAIN or close >= metrics["stage_high"] * HIGH_NEAR_PEAK
-    if is_yin and prev_yang and engulfing and pct_change <= LONG_YIN_PCT and is_high:
-        reduce_reasons.append(
-            f"高位长阴吞没（跌幅{pct_change:+.1f}%，近5日{metrics['gain5']:+.1f}%）"
-        )
+    if close < ma5 and vol_ratio >= VOL_RATIO_NORMAL:
+        reduce_reasons.append(f"放量跌破5日线（量比{vol_ratio:.1f}≥{VOL_RATIO_NORMAL}，收盘{close:.2f}<MA5 {ma5:.2f}）")
 
     # 阶段高点回撤
     if metrics["stage_high"] > 0:
         drawdown = (close - metrics["stage_high"]) / metrics["stage_high"] * 100
-        if drawdown <= -dd_thr:
+        if drawdown <= -DRAWDOWN_NORMAL:
             reduce_reasons.append(
-                f"阶段高点回撤{drawdown:.1f}% ≥ {dd_thr}%{tag}（高点{metrics['stage_high']:.2f}→{close:.2f}）"
+                f"阶段高点回撤{drawdown:.1f}% ≥ {DRAWDOWN_NORMAL}%（高点{metrics['stage_high']:.2f}→{close:.2f}）"
             )
 
     # 板块明显走弱
-    if sector_pct is not None and sector_pct <= sector_thr:
-        reduce_reasons.append(f"板块明显走弱{tag}（当日{sector_pct:+.1f}% ≤ {sector_thr}%）")
+    if sector_pct is not None and sector_pct <= SECTOR_WEAK_NORMAL:
+        reduce_reasons.append(f"板块明显走弱（当日{sector_pct:+.1f}% ≤ {SECTOR_WEAK_NORMAL}%）")
 
-    # ── 止盈保护（建议减半，余仓按趋势持有）──
-    stall = pct_change < TP_STALL_GAIN or metrics["close_position"] < TP_CLOSE_POS
-    if profit_pct >= TP_PROFIT_PCT and vol_ratio >= vol_thr and stall:
-        reduce_reasons.append(
-            f"止盈保护：盈利{profit_pct:.1f}%≥{TP_PROFIT_PCT}% 且放量滞涨"
-            f"（量比{vol_ratio:.1f}，涨幅{pct_change:+.1f}%）"
-        )
+    # --- Cycle 吸收：B1 延伸动作并入动作池 ---
+    # 只增原因不改判定：clear > reduce_half 的既有"取最强"逻辑不变。
+    if ext_action:
+        ext_kind, ext_reason = ext_action
+        if ext_kind == "clear":
+            clear_reasons.append(ext_reason)
+        elif ext_kind == "reduce_half":
+            reduce_reasons.append(ext_reason)
 
     if clear_reasons:
         return "clear", clear_reasons, ""
@@ -318,33 +264,35 @@ def _check_rules(metrics: dict, profit_pct: float, regime: str,
 
 
 def detect_sell_signals(code: str, name: str, df: pd.DataFrame, position: dict,
-                        regime: str,
                         sector: str = UNKNOWN_SECTOR,
                         sector_pct: Optional[float] = None,
                         entry_date: str = "",
-                        exit_ctx: Optional[dict] = None) -> Optional[SellSignal]:
+                        exit_ctx: Optional[dict] = None,
+                        ext_action: Optional[Tuple[str, str]] = None) -> Optional[SellSignal]:
     """检测单只持仓的卖出信号。
 
     Args:
         code/name: 股票代码与名称
         df: 已排序并计算 MA5/MA10/MA20 的日线 DataFrame
         position: 妙想持仓接口返回的标准化 dict（含 count/cost_price/profit_pct）
-        regime: 市场状态（trending_up/weak_up/sideways/trending_down/chaos）
         sector: 所属板块名称（取不到时为 UNKNOWN_SECTOR）
         sector_pct: 板块当日涨跌幅（None=无法判断，板块类规则跳过）
         entry_date: 买入日期（历史委托推导，可为空）
-        exit_ctx: 持有端退出上下文（移动止盈触发价/持有天数/peak），见 _check_rules
+        exit_ctx: 持有端退出上下文（持有天数等），见 _check_rules
+        ext_action: Cycle 吸收 B1 延伸动作 (kind, reason)，见 _check_rules（默认 None=当日无 B1 动作）
 
     Returns:
         SellSignal 或 None（无信号）。suggest_shares 已按可卖量收敛并取整到 100 整数倍，
         可能因可用不足而为 0（调用方按不足一手处理，不直接下单）。
+
+    卖出判定不依赖市场状态（gate 只作用于开仓侧）。
     """
     metrics = _compute_metrics(df)
     if metrics is None:
         return None
 
     profit_pct = position_profit_pct(position)
-    action, reasons, note = _check_rules(metrics, profit_pct, regime, sector_pct, exit_ctx)
+    action, reasons, note = _check_rules(metrics, sector_pct, exit_ctx, ext_action)
     if not action:
         return None
 
@@ -399,7 +347,7 @@ def _df_to_pct_map(df, name_col: str, pct_col: str) -> Dict[str, float]:
 def fetch_sector_pct_map() -> Dict[str, float]:
     """拉取全量行业板块当日涨跌幅 {板块名: 涨跌幅%}，失败返回空字典。
 
-    多源回退：akshare 东财全量板块 → akshare 新浪 → efinance（东财实时），
+    多源回退：akshare（fetcher 内部 新浪 → 东财）→ efinance（东财实时），
     单一数据源不稳定不影响整体；全部失败时板块类卖出规则跳过。
     """
     from data_provider.fetchers.akshare_fetcher import AkshareFetcher

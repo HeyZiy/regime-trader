@@ -13,7 +13,8 @@ import string
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.market_state.market_gate import REGIME_CAN_OPEN, RegimeDiagnosis
+from src.market_state.cycle_stage import STAGE_LABELS as _CYCLE_STAGE_LABELS
+from src.market_state.market_gate import RegimeDiagnosis
 from src.trend.signal_detector import UNKNOWN_SECTOR, TechnicalSignal
 
 logger = logging.getLogger(__name__)
@@ -252,8 +253,8 @@ def _build_action_guide(s: TechnicalSignal, market_open: bool = True) -> dict:
         # （T+1 确认后买经回测证伪，配对差 -0.67pp）。
         guide['confirmation'] = f"今日盘后 15:05-15:30：按收盘价 {_f(s.current_price)} 固定价格申报买入"
         guide['invalidation'] = (
-            f"由卖出规则接管：现价 ≤ max(持仓期最高收盘, 入场价)×0.90 清仓"
-            f"（初始触发 ≈ {_f(s.current_price * 0.9)}），或持满 16 个交易日到期"
+            f"由卖出规则接管：B1 延伸计数（第2次延伸减半/第3次清仓）、"
+            f"阶段高点回撤≥5%减半、破位清仓，或持满 16 个交易日到期"
         )
         guide['sizing'] = "正常仓位(50%)"
 
@@ -536,6 +537,28 @@ def format_immediate_signal_alert(signal: TechnicalSignal,
     return "\n".join(lines)
 
 
+def _format_cycle_info(info: dict) -> List[str]:
+    """Cycle 吸收组件的日报展示行（「市场环境」节内）。
+
+    stage/cap 来自 src/market_state/cycle_stage.py 的当日快照；
+    cap 即生效中的组合仓位上限（截断说明见 cap_note）。
+    """
+    stage = info.get("stage") or ""
+    if not stage:
+        return ["> ℹ️ Cycle 阶段快照缺失（指数数据不足），档位旁路未生效。", ""]
+    cap = info.get("cap")
+    cap_text = f"{float(cap) * 100:.0f}%" if cap is not None else "—"
+    parts = [
+        f"**Cycle 循环阶段**：{_CYCLE_STAGE_LABELS.get(stage, stage)}",
+        f"组合仓位上限 {cap_text}",
+    ]
+    if info.get("allow_override"):
+        parts.append("A2 快速通道放行（仅当日）")
+    if info.get("cap_note"):
+        parts.append(info["cap_note"])
+    return ["> " + "｜".join(parts), ""]
+
+
 def _format_regime_diagnosis(diag: Optional[RegimeDiagnosis]) -> List[str]:
     """状态判定的诊断明细：均线排列 + 偏离 MA20 百分比 + 命中路径。
 
@@ -562,7 +585,7 @@ def _format_regime_diagnosis(diag: Optional[RegimeDiagnosis]) -> List[str]:
     return lines
 
 
-def _format_headline(signals: List[TechnicalSignal], removed_stocks, vetoed_stocks,
+def _format_headline(signals: List[TechnicalSignal], vetoed_stocks,
                      failed_stocks) -> List[str]:
     """报告头条：先说结论——有多少信号、多少达标、能不能动手。"""
     qualified = sum(1 for s in signals if s.score >= QUALIFY_SCORE)
@@ -583,8 +606,7 @@ def _format_headline(signals: List[TechnicalSignal], removed_stocks, vetoed_stoc
         lines.extend([f"> ✅ 可执行盘后买入（15:05-15:30）：**{qualified}** 只。", ""])
 
     lines.extend([
-        f"> 跳过（趋势破坏）**{len(removed_stocks)}** 只 | 负面清单 **{len(vetoed_stocks)}** 只 | "
-        f"失败 **{len(failed_stocks)}** 只",
+        f"> 负面清单 **{len(vetoed_stocks)}** 只 | 失败 **{len(failed_stocks)}** 只",
         "",
         "---",
         "",
@@ -594,12 +616,12 @@ def _format_headline(signals: List[TechnicalSignal], removed_stocks, vetoed_stoc
 
 def generate_technical_report(
     signals: List[TechnicalSignal],
-    removed_stocks = None,
     market_env: Optional[Tuple] = None,
     failed_stocks = None,
     vetoed_stocks = None,
     detail_level: str = "standard",
     regime_diag: Optional[RegimeDiagnosis] = None,
+    cycle_info: Optional[dict] = None,
 ) -> str:
     """
     生成 Markdown 格式的趋势跟踪日报。
@@ -607,7 +629,7 @@ def generate_technical_report(
     所有表格统一走 _row() / _header()：表头列数与行模板占位符数不一致、
     或传入字段与占位符不匹配，都会抛 ValueError 而不是产出静默错位的表格。
 
-    精简口径：拦截（负面清单）与跳过（趋势破坏）只在头条给数量，不再罗列逐只明细；
+    精简口径：拦截（负面清单）只在头条给数量，不再罗列逐只明细；
     信号明细紧跟在市场环境之后，买点不会被长列表压到底部。
 
     报告结构（自上而下 = 决策优先级）：
@@ -615,17 +637,17 @@ def generate_technical_report(
 
     Args:
         signals: TechnicalSignal 列表
-        removed_stocks: (code, name, reason) 元组列表（仅计数，不列明细）
         market_env: (can_trade, conditions, summary, regime) 或 None
         failed_stocks: (code, name, reason) 元组列表
         vetoed_stocks: (code, name, action, reason) 元组列表，action 见 veto_rules（仅计数，不列明细）
         detail_level: "compact"（不含盘后计划）| "standard"（文件标准）| "full"（完整含操作计划）
         regime_diag: 市场状态判定明细（RegimeDiagnosis）
+        cycle_info: Cycle 吸收当日快照（src/market_state/cycle_stage.py），None = 指数数据
+            不足未产出；展示行见 _format_cycle_info
 
     Returns:
         格式化的 Markdown 字符串
     """
-    removed_stocks = removed_stocks or []
     failed_stocks = failed_stocks or []
     vetoed_stocks = vetoed_stocks or []
     # 能否开仓是市场层决策（can_trade 已含状态与门控判定），统一作用于全部信号
@@ -634,7 +656,7 @@ def generate_technical_report(
 
     # ── 头条：先给结论（发现 N 个 / 达标 M 个 / 能不能动手）──
     lines = [f"# 📊 趋势跟踪日报 ({today_str})", ""]
-    lines.extend(_format_headline(signals, removed_stocks, vetoed_stocks, failed_stocks))
+    lines.extend(_format_headline(signals, vetoed_stocks, failed_stocks))
 
     # 大盘状态栏
     if market_env:
@@ -654,11 +676,16 @@ def generate_technical_report(
         style_line = _style_state_display()
         if style_line:
             lines.extend([f"> **风格状态**：{style_line}", ""])
+        # Cycle 吸收：stage/cap 快照展示（开仓放行裁决在 trend_analysis 侧完成）
+        if cycle_info is not None:
+            lines.extend(_format_cycle_info(cycle_info))
         # 判定明细：排列 + 偏离 MA20 + 命中路径，回答"为什么判成这个状态"
         lines.extend(_format_regime_diagnosis(regime_diag))
 
-        # 当前环境是否允许开仓（能否开仓 = 市场层统一决策，作用于全部信号）
-        if regime not in REGIME_CAN_OPEN:
+        # 当前环境是否允许开仓（能否开仓 = 市场层统一决策 + Cycle A2 快速通道旁路，
+        # 作用于全部信号；按最终放行结论判定而非 regime 原始状态——A2 放行日 regime
+        # 可能仍是禁开状态，此时应走正常介入文案）
+        if not market_open:
             lines.extend([
                 "",
                 "> 📌 当前状态**不开新仓**：信号仅作观察（持仓卖出照常）。",

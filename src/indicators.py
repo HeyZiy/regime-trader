@@ -170,9 +170,45 @@ def volume_ratio(volume: pd.Series) -> pd.Series:
     return ratio.fillna(1.0)
 
 
+def bias(close: pd.Series, ma: pd.Series) -> pd.Series:
+    """乖离率：收盘价相对均线的偏离百分比。
+
+    bias = (close - ma) / ma * 100
+
+    Args:
+        close: 收盘价序列
+        ma: 均线序列（如 MA5/MA10/MA20）
+
+    Returns:
+        乖离率序列（%）；ma 为 0/NaN 处按 pandas 除法语义得 inf/NaN，不做特殊处理
+    """
+    return (close - ma) / ma * 100
+
+
+def atr(df: pd.DataFrame, n: int) -> pd.Series:
+    """ATR(n)：TR 的简单滚动均值（与探索包 trend_core 口径一致，非 Wilder）。
+
+    Args:
+        df: 日线 DataFrame（需含 high/low/close 列）
+        n: 计算周期（如 5/20）
+
+    Returns:
+        ATR 序列
+    """
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(n).mean()
+
+
 def add_standard_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    为日线 df 追加标准指标列：ma5 / ma10 / ma20 / volume_ratio。
+    为日线 df 追加标准指标列：ma5 / ma10 / ma20 / volume_ratio / bias_ma5 / bias_ma10 / bias_ma20。
 
     原 BaseFetcher._calculate_indicators 的逻辑（2026-08-26 从数据层摘出）：
     指标计算属分析层关注点，由入口脚本在取数后统一调用；
@@ -183,6 +219,10 @@ def add_standard_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['ma10'] = ma(df['close'], 10, min_periods=1)
     df['ma20'] = ma(df['close'], 20, min_periods=1)
     df['volume_ratio'] = volume_ratio(df['volume'])
-    indicator_cols = ['ma5', 'ma10', 'ma20', 'volume_ratio']
+    df['bias_ma5'] = bias(df['close'], df['ma5'])
+    df['bias_ma10'] = bias(df['close'], df['ma10'])
+    df['bias_ma20'] = bias(df['close'], df['ma20'])
+    indicator_cols = ['ma5', 'ma10', 'ma20', 'volume_ratio', 'bias_ma5', 'bias_ma10', 'bias_ma20']
     df[indicator_cols] = df[indicator_cols].round(2)
     return df
+

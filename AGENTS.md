@@ -7,14 +7,14 @@ style_report.py     → 风格状态周报：周度判定 主线强势期/退潮
                        落盘 data/style_state.json；--backtest 历史回放验证标签
 
 src/trend/                       ← 趋势策略全链路：分析器(analyzer)、信号检测(signal_detector)、
-                                   负面清单硬否决(veto_rules，9条规则，位于跳过规则与信号检测之间)、
-                                   跳过规则(skip_rules)、卖出规则(sell_rules，只判定不下单)、
+                                   负面清单硬否决(veto_rules，V1/V4 硬否决 + V5 观察项，位于信号检测之前)、
+                                   卖出规则(sell_rules，只判定不下单)、
+                                   Cycle 个股组件(cycle_overlay：B1延伸计数/C1 ATR过滤/D1方向门，全开)、
                                    日报生成(report，买入侧)
 trend_sell.py                    ← 尾盘卖出任务(14:45)：读妙想持仓→sell_rules 判定→
                                    自动下模拟仓市价单→自出成交报告并推送
 src/market_state/                ← 市场环境判断（跨策略共享）：趋势状态判定(market_gate，
-                                   指数均线纯结构 5 级；指数数据 AmazingData 单源——K线+快照补
-                                   当日bar+数据日期断言，无 akshare 回退)、风格状态判定(style_state)，
+                                   指数均线纯结构 5 级；指数数据 AmazingData 单源——K线+快照补当日bar+数据日期断言，无 akshare 回退)、风格状态判定(style_state)、Cycle 指数循环定位(cycle_stage：A1仓位档位/A2快速通道，全开)，
                                    文档见 strategy/style_state.md
 src/indicators.py                ← numba 指标算子封装（纯计算，无交易语义，根级别共享工具）
 src/etf/                         ← ETF 配置：再平衡+新钱投放(rebalancer)、
@@ -49,7 +49,7 @@ python etf_observe.py --force            # 跳过交易日检查（调试用）
 python etf_observe.py --no-notify --debug
 ```
 
-No test suite, no lint/typecheck commands.
+组件单测：`python -m pytest tests/`（Cycle 吸收组件 + 开关全关等价性）；无 lint/typecheck 命令。
 
 ## 部署与定时任务
 
@@ -67,9 +67,12 @@ No test suite, no lint/typecheck commands.
 ## Key Conventions
 
 - Chinese docstrings and comments throughout
-- `data/` holds cached state (e.g. `style_state.json`, `momentum_rank_history.json`)
+- `data/` holds cached state (e.g. `style_state.json`, `position_exit_state.json`, `cycle_state.json`, `momentum_rank_history.json`)
 - Logging via `src/logging_config.py:setup_logging()` — console + file + debug file handlers
 - All stock codes normalized via `data_provider.base:canonical_stock_code()`
+- Cycle 吸收（A1/A2/B1/C1/D1，证据与决策台账存档 `research/cycle_absorption/`）：阈值见
+  `strategy/trend_strategy.md`「Cycle 吸收组件」节，改动须同步文档并重跑证据；组件作为整体
+  使用，勿单独启停（消融证明部分启用有害）
 - 目录归属规则：只服务一个策略 → 进该策略的包（`src/trend/`、`src/etf/`）；
   跨策略共享且有交易语义 → 共享概念包（`src/market_state/`）；
   纯计算/无交易语义 → `src/` 根级别工具（如 `indicators.py`）

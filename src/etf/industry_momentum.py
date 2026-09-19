@@ -7,8 +7,9 @@
 主账户卫星仓的战术策略：动量策略族的行业粒度子策略，
 赚行业相对市场超额延续的钱。三层结构：
 
-  1. 选行业（周频截面排名，momentum_score）—— 价能 60（相对沪深300 的 20/60 日
-     超额收益截面排名）+ 量能 40（ETF 量比 vol_ma5/vol_ma60），前 3 名进关注池
+  1. 选行业（周频截面排名，momentum_score）—— 价能 60（ETF 自身收盘价相对沪深300
+     的 20/60 日超额截面排名，2026-09-16 口径切换 v2.1）+ 量能 40（资金迁移 20 行业
+     口径 + 交易热度 20 自身分位），前 3 名进关注池
   2. 入场时机（突破触发）—— 关注池内 ETF 出现放量突破（60日新高/平台突破 +
      涨幅区间 + 量比门槛）才建仓；排名只说明该关注，突破才说明资金来了
   3. 持仓管理（动量退出）—— 拿住直到动量证伪：相对强度转负 / 连续 2 次周度
@@ -161,8 +162,8 @@ def analyze_etf(code: str, name: str = "", df: Optional[pd.DataFrame] = None) ->
     prev_close = float(close.iloc[-2]) if len(close) >= 2 else float(latest["close"])
     chg_pct = (float(latest["close"]) / prev_close - 1) * 100
 
-    vol_ratio_5 = float(latest["vol_ma5"]) and float(latest["volume"]) / float(latest["vol_ma5"])
-    vol_ratio_20 = float(latest["vol_ma20"]) and float(latest["volume"]) / float(latest["vol_ma20"])
+    vol_ratio_5 = float(latest["volume"]) / float(latest["vol_ma5"]) if float(latest["vol_ma5"]) > 0 else 0.0
+    vol_ratio_20 = float(latest["volume"]) / float(latest["vol_ma20"]) if float(latest["vol_ma20"]) > 0 else 0.0
 
     high_60 = float(close.iloc[-60:].max())
     high_20, low_20 = float(close.iloc[-20:].max()), float(close.iloc[-20:].min())
@@ -238,31 +239,10 @@ def _pct_in_window(s: pd.Series, lookback: int) -> Optional[float]:
     return round(float((w < w.iloc[-1]).mean() * 100), 1)
 
 
-def _industry_excess(ind_code: str, hs300_close: pd.Series) -> Optional[dict]:
-    """行业指数相对沪深300 的 20/60 日超额收益（%），按共同交易日对齐。"""
-    from src.etf.amazing_factors import get_industry_daily
-    ind_df = get_industry_daily(ind_code)
-    if ind_df is None or "CLOSE" not in ind_df.columns:
-        return None
-    ind_close = ind_df["CLOSE"]
-    # 对齐键归一化为 YYYY-MM-DD（行业指数索引为 datetime，沪深300 可能为字符串）
-    ind_close.index = pd.to_datetime(ind_close.index).strftime("%Y-%m-%d")
-    hs300_close = hs300_close.copy()
-    hs300_close.index = pd.to_datetime(hs300_close.index).strftime("%Y-%m-%d")
-    # 部分行业日线含重复日期（复权/补数痕迹），去重后再对齐
-    ind_close = ind_close[~ind_close.index.duplicated(keep="last")]
-    hs300_close = hs300_close[~hs300_close.index.duplicated(keep="last")]
-    aligned = pd.concat([ind_close.rename("ind"), hs300_close.rename("mkt")], axis=1).dropna()
-    if len(aligned) < 65:
-        return None
-    try:
-        ex20 = (aligned["ind"].iloc[-1] / aligned["ind"].iloc[-21]
-                - aligned["mkt"].iloc[-1] / aligned["mkt"].iloc[-21]) * 100
-        ex60 = (aligned["ind"].iloc[-1] / aligned["ind"].iloc[-61]
-                - aligned["mkt"].iloc[-1] / aligned["mkt"].iloc[-61]) * 100
-        return {"excess_20d": round(float(ex20), 1), "excess_60d": round(float(ex60), 1)}
-    except (IndexError, ZeroDivisionError):
-        return None
+def _normalize_index(s: pd.Series) -> pd.Series:
+    """索引归一化为 YYYY-MM-DD 字符串并按最后出现去重（就地修改传入 Series 的索引）。"""
+    s.index = pd.to_datetime(s.index).strftime("%Y-%m-%d")
+    return s[~s.index.duplicated(keep="last")]
 
 
 def _industry_flow_factors(ind_code: str) -> Optional[dict]:
@@ -280,9 +260,7 @@ def _industry_flow_factors(ind_code: str) -> Optional[dict]:
     df = get_industry_daily(ind_code)
     if df is None or "CLOSE" not in df.columns:
         return None
-    close = df["CLOSE"]
-    close.index = pd.to_datetime(close.index).strftime("%Y-%m-%d")
-    close = close[~close.index.duplicated(keep="last")]
+    close = _normalize_index(df["CLOSE"])
 
     close_pct = _pct_in_window(close, CROWD_LOOKBACK)
 
@@ -319,43 +297,71 @@ def _vol_score(res: dict) -> int:
 
 
 def _attach_momentum_scores(results: List[dict]) -> List[dict]:
-    """给每只 ETF 附加行业动量分（截面排名归一化）与复合拥挤度，标注关注池。
+    """给每只 ETF 附加动量分（截面排名归一化）与复合拥挤度，标注关注池。
 
-    价能 60 = 20日超额排名 ×30 + 60日超额排名 ×30（截面百分位）；
-    量能 40 = 资金迁移 20（成交额占比 5 日变化截面排名）+ 交易热度 20（占比自身分位）。
-    拥挤度（PE分位/交易热度/位置热度均值）不进打分，只做退出熔断与仓位缩放。
+    2026-09-16 口径切换 v2.1：价能改为 **ETF 自身收盘价** 相对沪深300 的 20/60 日
+    超额（截面排名）——与交易对象一致、消除行业指数代理误差、统一风格品种口径。
+    量能与拥挤度保留行业口径：资金迁移（行业成交额占全市场比重的 5 日变化）是
+    真实行业资金信号，ETF 成交额会被份额扩容污染（515010 教训）。
+    无行业映射的叙事组标的（风格:小市值等自造类）：量能热度/拥挤度回退为自身口径
+    （成交额代理分位 / 价格位置分位），资金迁移子项记缺失，动量分上限相应降低。
     """
-    from src.etf.amazing_factors import get_etf_industry, get_industry_code_by_name
-    from data_provider import get_index_daily
+    from src.etf.amazing_factors import (
+        get_etf_industry, get_industry_code_by_name, get_etf_group,
+    )
+    from data_provider import get_etf_daily, get_index_daily
 
     hs300 = get_index_daily(HS300_INDEX)
     hs300_close = hs300.set_index("date")["close"] if hs300 is not None else None
     if hs300_close is None:
-        logger.warning("沪深300 日线获取失败，本轮动量分退化为纯量能口径")
+        logger.warning("沪深300 日线获取失败，本轮动量分不可用")
+    else:
+        hs300_close = _normalize_index(hs300_close.copy())
 
-    # 预取全部行业量能/拥挤度因子（一次遍历，share 分母跨行业共享）
-    flow_cache: Dict[str, Optional[dict]] = {}
     for r in results:
         r["industry"] = None
+        r["group"] = get_etf_group(r["code"])
         r["excess_20d"] = None
         r["excess_60d"] = None
         r["amt_share_5d_chg"] = None
         r["amt_share_pct"] = None
         r["crowding_pct"] = None
+        r["_pe_pct_ind"] = None
+        r["_momentum_source"] = None
         r["_flow_rank_score"] = 0.0
         r["momentum_score"] = 0
         r["momentum_rank"] = None
         r["pool"] = False
+
+    # 1) 价能：全部标的统一用自身收盘价（买的是 ETF，量的是 ETF）
+    if hs300_close is not None:
+        for r in results:
+            try:
+                df = get_etf_daily(r["code"])
+                if df is None or len(df) < 65:
+                    continue
+                close = pd.Series(df["close"].values, index=df["date"].values)
+                close = close[~close.index.duplicated(keep="last")]
+                aligned = pd.concat([close.rename("etf"), hs300_close.rename("mkt")],
+                                    axis=1).dropna()
+                if len(aligned) < 65:
+                    continue
+                r["excess_20d"] = round((aligned["etf"].iloc[-1] / aligned["etf"].iloc[-21]
+                                         - aligned["mkt"].iloc[-1] / aligned["mkt"].iloc[-21]) * 100, 4)
+                r["excess_60d"] = round((aligned["etf"].iloc[-1] / aligned["etf"].iloc[-61]
+                                         - aligned["mkt"].iloc[-1] / aligned["mkt"].iloc[-61]) * 100, 4)
+            except Exception:
+                logger.warning(f"ETF 价能计算失败 {r['code']}", exc_info=True)
+
+    # 2) 量能/拥挤度：行业口径（有行业映射的标的）
+    flow_cache: Dict[str, Optional[dict]] = {}
+    for r in results:
         try:
             industry = get_etf_industry(r["code"])
             r["industry"] = industry
             ind_code = get_industry_code_by_name(industry) if industry else None
             if not ind_code:
                 continue
-            if hs300_close is not None:
-                ex = _industry_excess(ind_code, hs300_close)
-                if ex:
-                    r["excess_20d"], r["excess_60d"] = ex["excess_20d"], ex["excess_60d"]
             if ind_code not in flow_cache:
                 flow_cache[ind_code] = _industry_flow_factors(ind_code)
             ff = flow_cache[ind_code]
@@ -365,22 +371,35 @@ def _attach_momentum_scores(results: List[dict]) -> List[dict]:
                 r["crowding_pct"] = ff["crowding_pct"]
                 r["_pe_pct_ind"] = ff["pe_pct"]
         except Exception:
-            logger.warning(f"行业动量因子获取失败 {r['code']}", exc_info=True)
+            logger.warning(f"行业量能因子获取失败 {r['code']}", exc_info=True)
 
-    # 价能：截面排名归一化（有超额数据的标的间比百分位）
+    # 3) 回退：无行业映射的叙事组标的，量能热度/拥挤度用自身口径降级
+    for r in results:
+        if r.get("group") and r["amt_share_pct"] is None and r["crowding_pct"] is None:
+            try:
+                df = get_etf_daily(r["code"])
+                if df is None or len(df) < 70:
+                    continue
+                amts = (df["volume"] * df["close"]).tail(250)
+                r["amt_share_pct"] = _pct_in_window(amts, 250)
+                closes = pd.Series(df["close"].values, index=df["date"].values).tail(250)
+                r["crowding_pct"] = _pct_in_window(closes, 250)
+                r["_momentum_source"] = "etf_self"
+            except Exception:
+                logger.warning(f"自身量能回退失败 {r['code']}", exc_info=True)
+
+    # 4) 截面排名与动量分（n<=1 时该项记满分中位，防止除零）
     scored = [r for r in results if r["excess_20d"] is not None]
     n = len(scored)
-    if n >= 2:
-        for key in ("excess_20d", "excess_60d"):
-            ordered = sorted(scored, key=lambda x: x[key])
-            for i, r in enumerate(ordered):
-                r[f"_pct_{key}"] = i / (n - 1) * 30
-        # 量能·资金迁移：成交额占比 5 日变化的截面排名 ×20
-        flowed = [r for r in scored if r["amt_share_5d_chg"] is not None]
-        if len(flowed) >= 2:
-            ordered = sorted(flowed, key=lambda x: x["amt_share_5d_chg"])
-            for i, r in enumerate(ordered):
-                r["_flow_rank_score"] = i / (len(flowed) - 1) * 20
+    for key in ("excess_20d", "excess_60d"):
+        ordered = sorted(scored, key=lambda x: x[key])
+        for i, r in enumerate(ordered):
+            r[f"_pct_{key}"] = i / (n - 1) * 30 if n > 1 else 15.0
+    flowed = [r for r in scored if r["amt_share_5d_chg"] is not None]
+    if len(flowed) >= 2:
+        ordered = sorted(flowed, key=lambda x: x["amt_share_5d_chg"])
+        for i, r in enumerate(ordered):
+            r["_flow_rank_score"] = i / (len(flowed) - 1) * 20
     for r in scored:
         r["momentum_score"] = round(
             r.get("_pct_excess_20d", 0) + r.get("_pct_excess_60d", 0) + _vol_score(r))
@@ -555,14 +574,16 @@ def build_buy_orders(results: List[dict], held_codes: set, total_assets: float,
                   and (r.get("crowding_pct") is None or r["crowding_pct"] < CROWD_EXIT)]
     candidates.sort(key=lambda r: r["momentum_score"], reverse=True)
 
-    # 同行业多只 ETF 只保留动量分最高的一只（本策略买的是行业 β，不重复押注）
-    seen_industries: set = set()
+    # 同叙事槽位只保留动量分最高的一只（行业 β 或叙事 β，不重复押注）。
+    # 2026-09-16：去重键优先用叙事组 group（如 AI算力组内 AI/芯片/通信互相镜像），
+    # 无组回退行业——见 update_standards.md 叙事重叠纪律。
+    seen_slots: set = set()
     deduped = []
     for r in candidates:
-        ind = r.get("industry") or r["code"]
-        if ind in seen_industries:
+        slot = r.get("group") or r.get("industry") or r["code"]
+        if slot in seen_slots:
             continue
-        seen_industries.add(ind)
+        seen_slots.add(slot)
         deduped.append(r)
     candidates = deduped
 
