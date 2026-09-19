@@ -494,49 +494,6 @@ def format_buy_signal_alert(signals: List[TechnicalSignal],
     return "\n".join(lines)
 
 
-def format_immediate_signal_alert(signal: TechnicalSignal,
-                                   market_env: Optional[Tuple] = None) -> Optional[str]:
-    """单条信号的即时提醒（发现信号立即推送，不等完整日报）。
-
-    只提醒达标买点（pullback_ma5 / pullback_ma10 且评分≥QUALIFY_SCORE）。
-    观察信号（near_ma5）不发即时提醒，只在日报中记录。
-
-    Args:
-        signal: 单个技术信号
-        market_env: (can_trade, conditions, summary, regime) 或 None
-
-    Returns:
-        Markdown 提醒文本；非达标买点返回 None
-    """
-    buy_types = ("pullback_ma5", "pullback_ma10")
-    if signal.signal_type not in buy_types or signal.score < QUALIFY_SCORE:
-        return None
-
-    market_open = bool(market_env and market_env[0])
-    today_str = datetime.now().strftime('%H:%M')
-    guide = _build_action_guide(signal, market_open)
-    lines = [
-        f"# 🎯 买点信号 ({today_str})",
-        "",
-        f"**{signal.name}({signal.code})**  |  板块: {signal.sector}",
-        "",
-        f"- **信号**: {_SIGNAL_LABELS.get(signal.signal_type, signal.signal_type)}",
-        f"- **评分**: {signal.score} 分",
-        f"- **价格**: {_f(signal.current_price)} 元",
-        f"- **涨跌**: {_f_pct(signal.pct_change)}%",
-        f"- **量比**: {_f(signal.volume_ratio)}",
-        f"- **换手**: {_f(signal.turnover_rate)}%",
-        f"- **乖离**: {_f_pct(signal.bias_ma5)}%",
-        "",
-        f"**操作**: {guide['observation']}",
-        f"**介入**: {guide['confirmation']}",
-        "",
-    ]
-    if not market_open:
-        lines.extend(["> ⛔ 市场状态不开新仓，仅作观察。", ""])
-    return "\n".join(lines)
-
-
 def _format_cycle_info(info: dict) -> List[str]:
     """Cycle 吸收组件的日报展示行（「市场环境」节内）。
 

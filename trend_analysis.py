@@ -46,7 +46,6 @@ from src.indicators import add_standard_indicators
 from src.config import setup_env
 from src.notify.service import NotificationService
 from src.mx.service import MXService
-from src.mx.position_utils import filter_stock_positions
 from src.mx.client import MXMoniClient
 from src.market_state.cycle_stage import (
     evaluate_open_gate, run_cycle_stage, save_cycle_state,
@@ -416,33 +415,11 @@ def _list_mx_screen(analyzer: 'SimpleTechnicalAnalyzer', keyword: str) -> int:
     return 0
 
 
-def _fetch_held_codes() -> set:
-    """读取妙想模拟仓股票持仓代码集合，用于抑制「已持仓又提示买入」。
-
-    只取代码，不做卖出检测（卖出由尾盘任务 trend_sell.py 负责）。
-
-    Returns:
-        股票持仓代码集合（取不到时返回空集合，买入信号照常输出）
-    """
-    if not os.getenv("MX_APIKEY"):
-        logger.warning("未配置 MX_APIKEY，跳过持仓读取（不抑制已持仓买入信号）")
-        return set()
-
-    try:
-        positions = filter_stock_positions(MXMoniClient().get_positions())
-    except Exception as e:
-        logger.warning(f"读取妙想持仓失败: {e}（不抑制已持仓买入信号）")
-        return set()
-
-    return {canonical_stock_code(p.get("code", "")) for p in positions}
-
-
 def _fetch_portfolio_exposure() -> Tuple[float, float]:
     """读妙想账户敞口：(持仓市值, 总资产)（元），供 Cycle A1 组合档位截断（每日一次）。
 
     持仓市值 = 总资产 − 可用余额。取不到（未配 MX_APIKEY / 接口失败）时返回
-    (0.0, 0.0) → evaluate_open_gate 的截断分支跳过（fail-open，与 _fetch_held_codes
-    的降级取向一致：数据缺失不放大拦截）。
+    (0.0, 0.0) → evaluate_open_gate 的截断分支跳过（fail-open：数据缺失不放大拦截）。
     """
     if not os.getenv("MX_APIKEY"):
         logger.warning("未配置 MX_APIKEY，Cycle 档位跳过组合敞口检查（fail-open）")
@@ -565,20 +542,6 @@ def main():
             stock_list, max_stocks=max_stocks, sort_by_pct=False,
             market_env=market_env, notifier=notifier,
         )
-
-        # 4.5 已持仓股票抑制买入信号（避免"持有又提示买入"）
-        held_codes = _fetch_held_codes()
-        if held_codes:
-            filtered = [s for s in signals if canonical_stock_code(s.code) not in held_codes]
-            if len(filtered) != len(signals):
-                logger.info(f"抑制 {len(signals) - len(filtered)} 只持仓股票的买入信号")
-            signals = filtered
-
-        # 汇总提醒（最后一条）：汇总今日发现的所有信号
-        summary_alert = format_buy_signal_alert(signals, market_env)
-        if summary_alert and notifier:
-            logger.info("推送今日信号汇总")
-            _send_notification(summary_alert, notifier)
 
         report = generate_technical_report(signals,
                                            market_env=market_env,
