@@ -7,7 +7,7 @@
 每交易日 14:45 尾盘运行，承担「检测 → 执行 → 出报告 → 通知」闭环：
 
 1. 读取妙想模拟仓股票持仓（持仓事实来源）
-2. 复用 src/trend/sell_rules.py 的完全分类规则检测卖出信号
+2. 复用 src/pullback_trend/sell_rules.py 的完全分类规则检测卖出信号
    （第一卖点减仓50%：放量破5日线/回撤≥5%/板块走弱；第二卖点清仓：破位+16日到期；
    Cycle 吸收 B1 延伸计数并入动作池）
 3. 命中即自动下模拟仓市价单（委托数量为 100 整数倍，按可用股数收敛）
@@ -45,11 +45,11 @@ from src.mx.position_utils import (
     filter_stock_positions, get_last_buy_dates_safe, position_profit_pct,
 )
 from src.notify.service import NotificationService
-from src.trend.cycle_overlay import ExhaustionTracker
-from src.trend.sell_rules import (
+from src.pullback_trend.cycle_overlay import ExhaustionTracker
+from src.pullback_trend.sell_rules import (
     HoldingRow, SellSignal, detect_sell_signals, fetch_sector_pct_map, match_sector_pct,
 )
-from src.trend.signal_detector import UNKNOWN_SECTOR
+from src.pullback_trend.signal_detector import UNKNOWN_SECTOR
 setup_env()
 
 logger = logging.getLogger(__name__)

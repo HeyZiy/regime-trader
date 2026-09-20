@@ -21,9 +21,9 @@ Cycle 吸收 B1 延伸计数：bias_MA10 ≥10% 计延伸事件——第 2 次�
 
 持仓事实来源：妙想模拟仓（用户手动同步持仓）。
 
-执行方式：由尾盘任务 trend_sell.py 在每交易日 14:45 后读取本模块信号，
+执行方式：由尾盘任务 pullback_sell.py 在每交易日 14:45 后读取本模块信号，
 自动下模拟仓市价单（reduce_half / clear 全部自动执行）。
-本模块只负责判定，不碰下单；下单与股数收敛见 trend_sell.py:execute_sell()。
+本模块只负责判定，不碰下单；下单与股数收敛见 pullback_sell.py:execute_sell()。
 
 量比口径：当日成交量 ÷ 前 5 日均量（不含当日）。
 
@@ -42,7 +42,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from src.mx.position_utils import position_profit_pct
-from src.trend.signal_detector import UNKNOWN_SECTOR, SignalFieldError
+from src.pullback_trend.signal_detector import UNKNOWN_SECTOR, SignalFieldError
 
 logger = logging.getLogger(__name__)
 

@@ -14,8 +14,8 @@ from typing import List
 
 import pandas as pd
 
-from src.trend.cycle_overlay import signal_filter_reason
-from src.trend.veto_rules import FROM_60D_LOW_MAX
+from src.pullback_trend.cycle_overlay import signal_filter_reason
+from src.pullback_trend.veto_rules import FROM_60D_LOW_MAX
 
 logger = logging.getLogger(__name__)
 

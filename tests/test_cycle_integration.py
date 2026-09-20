@@ -10,10 +10,10 @@
 import pandas as pd
 import pytest
 
-import src.trend.signal_detector as sd
-from src.trend.cycle_overlay import ExhaustionTracker
-from src.trend.report import generate_technical_report
-from src.trend.sell_rules import detect_sell_signals
+import src.pullback_trend.signal_detector as sd
+from src.pullback_trend.cycle_overlay import ExhaustionTracker
+from src.pullback_trend.report import generate_technical_report
+from src.pullback_trend.sell_rules import detect_sell_signals
 
 
 def _stock_df(closes, *, amplitudes=None, volumes=None):

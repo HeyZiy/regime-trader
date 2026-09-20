@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ===================================
-趋势交易策略 — 日度分析与信号检测
+趋势回踩策略 — 日度分析与信号检测
 ===================================
 
 定位：趋势波段系统。只做主线中的强趋势股，只在缩量回踩时介入。
@@ -23,14 +23,14 @@
 - 环境过滤：见 strategy/market.md
 - 选股名单每天由妙想选股重新生成：选股条件是信号触发条件的截面必要子集，
   票在"变得可买的那天"必然进入名单，无需名单记忆。
-  持仓不受影响：卖出由 trend_sell.py 负责
+  持仓不受影响：卖出由 pullback_sell.py 负责
 
 使用方式：
-    python trend_analysis.py                    # 正常运行
-    python trend_analysis.py --debug            # 调试模式
-    python trend_analysis.py --no-notify        # 不发送通知
-    python trend_analysis.py --stocks CODE1,CODE2  # 指定股票分析
-    python trend_analysis.py --max-stocks N     # 最多分析N只股票（按跌幅排序）
+    python pullback_analysis.py                    # 正常运行
+    python pullback_analysis.py --debug            # 调试模式
+    python pullback_analysis.py --no-notify        # 不发送通知
+    python pullback_analysis.py --stocks CODE1,CODE2  # 指定股票分析
+    python pullback_analysis.py --max-stocks N     # 最多分析N只股票（按跌幅排序）
 """
 import argparse
 import logging
@@ -53,15 +53,15 @@ from src.market_state.cycle_stage import (
 from src.market_state.market_gate import (
     check_market_gate, diagnose_regime, fetch_index_df,
 )
-from src.trend.analyzer import StockTrendAnalyzer
-from src.trend.veto_rules import (
+from src.pullback_trend.analyzer import StockTrendAnalyzer
+from src.pullback_trend.veto_rules import (
     check_external_veto, check_market_veto, VetoStats,
     FROM_60D_LOW_MAX, TURNOVER_DAY_MAX,
 )
-from src.trend.signal_detector import (
+from src.pullback_trend.signal_detector import (
     UNKNOWN_SECTOR, TechnicalSignal, detect_pullback_signals, MA20_BIAS_MAX,
 )
-from src.trend.report import format_buy_signal_alert, generate_technical_report, QUALIFY_SCORE
+from src.pullback_trend.report import format_buy_signal_alert, generate_technical_report, QUALIFY_SCORE
 setup_env()
 
 logger = logging.getLogger(__name__)
@@ -473,7 +473,7 @@ def main():
     setup_logging(log_prefix="stock_analysis_simple", debug=args.debug)
     
     logger.info("=" * 60)
-    logger.info("趋势交易策略 — 日度分析启动")
+    logger.info("趋势回踩策略 — 日度分析启动")
     logger.info(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
     

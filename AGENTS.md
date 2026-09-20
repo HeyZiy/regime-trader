@@ -6,12 +6,12 @@
 style_report.py     → 风格状态周报：周度判定 主线强势期/退潮期/真空期/形成中 + 主导风格，
                        落盘 data/style_state.json；--backtest 历史回放验证标签
 
-src/trend/                       ← 趋势策略全链路：分析器(analyzer)、信号检测(signal_detector)、
+src/pullback_trend/              ← 趋势回踩策略全链路：分析器(analyzer)、信号检测(signal_detector)、
                                    负面清单硬否决(veto_rules，V1/V4 硬否决 + V5 观察项，位于信号检测之前)、
                                    卖出规则(sell_rules，只判定不下单)、
                                    Cycle 个股组件(cycle_overlay：B1延伸计数/C1 ATR过滤/D1方向门，全开)、
                                    日报生成(report，买入侧)
-trend_sell.py                    ← 尾盘卖出任务(14:45)：读妙想持仓→sell_rules 判定→
+pullback_sell.py                 ← 尾盘卖出任务(14:45)：读妙想持仓→sell_rules 判定→
                                    自动下模拟仓市价单→自出成交报告并推送
 src/market_state/                ← 市场环境判断（跨策略共享）：趋势状态判定(market_gate，
                                    指数均线纯结构 5 级；指数数据 AmazingData 单源——K线+快照补当日bar+数据日期断言，无 akshare 回退)、风格状态判定(style_state)、Cycle 指数循环定位(cycle_stage：A1仓位档位/A2快速通道，全开)，
@@ -33,14 +33,14 @@ data/etf_industry_map.json      ← 行业 ETF 清单（申万行业 → 首选/
 python style_report.py                    # 周报：风格状态 + 下周怎么办 + 主线明细 + 风格指标
 python style_report.py --backtest 2021-01-01  # 历史回放状态时间线（不落盘不通知）
 
-# 趋势交易（每交易日：14:45 卖出执行 + 15:10 买入分析）
-python trend_sell.py                        # 尾盘卖出：检测→自动下模拟仓市价单→出成交报告并推送
-python trend_sell.py --dry-run              # 只检测不下单（调试用）
-python trend_analysis.py                    # 日度分析（选股名单=当日妙想选股结果，不读妙想自选）
-python trend_analysis.py --screen-keyword "..."  # 自定义妙想选股条件
-python trend_analysis.py --stocks 000001,600519  # 指定股票（覆盖当日选股名单）
-python trend_analysis.py --list             # 仅列出当日妙想选股名单
-python trend_analysis.py --debug --no-notify
+# 趋势回踩（每交易日：14:45 卖出执行 + 15:10 买入分析）
+python pullback_sell.py                     # 尾盘卖出：检测→自动下模拟仓市价单→出成交报告并推送
+python pullback_sell.py --dry-run           # 只检测不下单（调试用）
+python pullback_analysis.py                 # 日度分析（选股名单=当日妙想选股结果，不读妙想自选）
+python pullback_analysis.py --screen-keyword "..."  # 自定义妙想选股条件
+python pullback_analysis.py --stocks 000001,600519  # 指定股票（覆盖当日选股名单）
+python pullback_analysis.py --list          # 仅列出当日妙想选股名单
+python pullback_analysis.py --debug --no-notify
 
 # ETF 长期配置（每周一 9:35）
 python etf_observe.py                    # 周度观察报告（只出建议，不下单）
@@ -73,7 +73,7 @@ python etf_observe.py --no-notify --debug
 - Cycle 吸收（A1/A2/B1/C1/D1，证据与决策台账存档 `research/cycle_absorption/`）：阈值见
   `strategy/trend_strategy.md`「Cycle 吸收组件」节，改动须同步文档并重跑证据；组件作为整体
   使用，勿单独启停（消融证明部分启用有害）
-- 目录归属规则：只服务一个策略 → 进该策略的包（`src/trend/`、`src/etf/`）；
+- 目录归属规则：只服务一个策略 → 进该策略的包（`src/pullback_trend/`、`src/etf/`）；
   跨策略共享且有交易语义 → 共享概念包（`src/market_state/`）；
   纯计算/无交易语义 → `src/` 根级别工具（如 `indicators.py`）
 

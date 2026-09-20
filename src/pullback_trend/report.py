@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from src.market_state.cycle_stage import STAGE_LABELS as _CYCLE_STAGE_LABELS
 from src.market_state.market_gate import RegimeDiagnosis
-from src.trend.signal_detector import UNKNOWN_SECTOR, TechnicalSignal
+from src.pullback_trend.signal_detector import UNKNOWN_SECTOR, TechnicalSignal
 
 logger = logging.getLogger(__name__)
 

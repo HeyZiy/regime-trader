@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from src.market_state.cycle_stage import CYCLE_PARAMS
-from src.trend.cycle_overlay import (
+from src.pullback_trend.cycle_overlay import (
     ExhaustionTracker, evaluate_c1, evaluate_d1, signal_filter_reason,
 )
 

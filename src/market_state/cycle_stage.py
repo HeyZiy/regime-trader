@@ -63,10 +63,10 @@ class CycleConfig:
     panic_thr: float = -4.0         # 恐慌偏离阈值：bias vs MA10（%）
     panic_vol_mult: float = 1.5     # 恐慌量能：量 ≥ 1.5×前20日均量
     fp_window: int = 10             # 恐慌登记后的快速通道窗口（交易日）
-    # B1 个股延伸计数分批止盈（组件在 src/trend/cycle_overlay.py，阈值同源于此）
+    # B1 个股延伸计数分批止盈（组件在 src/pullback_trend/cycle_overlay.py，阈值同源于此）
     ext_stk_thr: float = 10.0       # 个股延伸阈值：bias vs MA10（%）
     ext_stk_reset: float = 4.0      # 延伸事件重置：bias 回落 < 4% 后再延伸才计新事件
-    # C1 ATR 扩张过滤 / D1 MA5 方向门（组件在 src/trend/cycle_overlay.py）
+    # C1 ATR 扩张过滤 / D1 MA5 方向门（组件在 src/pullback_trend/cycle_overlay.py）
     atr_exp_thr: float = 1.3        # ATR5/ATR20 > 1.3 视为扩张，剔除信号
 
 
